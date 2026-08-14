@@ -112,6 +112,7 @@ export class QoderAdapter extends LlmAdapter {
   ): Promise<LlmResolvedModelInfo> {
     const live = (await this.catalog.liveModels()).find(entry => entry.value === model)
     if (live !== undefined) {
+      const reasoning = reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning)
       return {
         provider,
         id: live.value,
@@ -120,17 +121,18 @@ export class QoderAdapter extends LlmAdapter {
         inputModalities: ['text' as const],
         context: { contextWindow: live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW },
         defaultMaxTokens: live.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
-        ...reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning),
+        ...reasoning === undefined ? {} : { reasoning },
       }
     }
     const configured = QODER_MODELS.find(entry => entry.id === model)
+    const reasoning = reasoningInfo(undefined, undefined, true)
     return Promise.resolve({
       ...configured === undefined
         ? { provider, id: model, name: model, inputModalities: ['text' as const] }
         : modelInfo(provider, configured),
       context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: DEFAULT_MAX_TOKENS,
-      ...reasoningInfo(undefined, undefined, true),
+      ...reasoning === undefined ? {} : { reasoning },
     })
   }
 

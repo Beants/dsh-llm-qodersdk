@@ -45,4 +45,4 @@
 
 ## License
 
-[MIT](LICENSE) © 2026 DeepSeek
+[MIT](LICENSE) © 2026 dsh-llm-qodersdk contributors

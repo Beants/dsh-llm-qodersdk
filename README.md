@@ -45,9 +45,17 @@
 
 ## 开发与构建
 
-本仓库只存源码（`src/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，发布时按需生成。
+本仓库只存源码（`src/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，由构建脚本按需生成。
 
-构建在 DeepSeek Harness 仓库内进行（该插件的 `package.json` 原样保留在 `plugins/llm-qoder/` 下，由仓库根配置 `tsc` + `tsdown` 产出 `lib/`）。当前 `@deepseek-ai/dsh-llm@^0.1.0-rc.5` 尚未发布到公共 npm（registry 上仅有 `0.0.1-rc.1`），因此在独立环境直接 `npm install` / 构建暂不可行；等依赖发布后再补齐独立的构建配置。
+```sh
+npm install
+npm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
+npm publish     # prepublishOnly 自动先构建
+```
+
+构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
+
+> **当前限制**：`@deepseek-ai/dsh-llm@^0.1.0-rc.5` 尚未发布到公共 npm（registry 上仅有 `0.0.1-rc.1`），因此 `npm install` 暂时无法解析该 peer 依赖，独立构建也暂不可运行。等它发布后，本仓库即可直接 `npm install && npm run build && npm publish`。在此之前，实际构建/使用仍在 DeepSeek Harness 仓库内的 `plugins/llm-qoder/` 完成（由仓库根配置 `tsc` + `tsdown` 产出 `lib/`）。
 
 ## License
 

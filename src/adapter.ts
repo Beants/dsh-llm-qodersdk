@@ -8,9 +8,9 @@
  * @module dsh-llm-qoder/adapter
  */
 
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
-  GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
+  GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import {
   DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, QODER_MODELS, resolveQoderModelId,
@@ -37,6 +37,49 @@ function modelInfo(provider: string, entry: { id: string, name: string, descript
     name: entry.name,
     ...entry.description === undefined ? {} : { description: entry.description },
     inputModalities: ['text'],
+  }
+}
+
+/**
+ * Default selectable reasoning efforts for a Qoder model. The CLI catalog
+ * reports per-model `efforts`; this is the fallback when a model (or the
+ * static catalog) discloses none.
+ */
+const DEFAULT_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'] as const
+
+/** Human display name for the default effort ids. */
+const EFFORT_NAMES: Readonly<Record<string, string>> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  max: 'Max',
+}
+
+/**
+ * Build the `reasoning` metadata block for a resolved model, or undefined
+ * when the model does not support reasoning.
+ * @param efforts - CLI-reported effort ids (absent for reasoning-less models).
+ * @param defaultEffort - CLI-reported default effort id.
+ * @param isReasoning - whether the model supports reasoning per the CLI.
+ * @returns the harness reasoning metadata, or undefined to omit it.
+ */
+function reasoningInfo(
+  efforts: readonly string[] | undefined,
+  defaultEffort: string | undefined,
+  isReasoning: boolean | undefined,
+): LlmModelReasoningInfo | undefined {
+  if (efforts === undefined && isReasoning === false) return undefined
+  const ids = efforts !== undefined && efforts.length > 0
+    ? efforts
+    : DEFAULT_REASONING_EFFORTS
+  return {
+    efforts: ids.map(id => ({
+      id: ReasoningEffortId(id),
+      name: EFFORT_NAMES[id] ?? id,
+    })),
+    ...defaultEffort !== undefined && ids.includes(defaultEffort)
+      ? { defaultEffort: ReasoningEffortId(defaultEffort) }
+      : {},
   }
 }
 
@@ -77,6 +120,7 @@ export class QoderAdapter extends LlmAdapter {
         inputModalities: ['text' as const],
         context: { contextWindow: live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW },
         defaultMaxTokens: live.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+        ...reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning),
       }
     }
     const configured = QODER_MODELS.find(entry => entry.id === model)
@@ -86,6 +130,7 @@ export class QoderAdapter extends LlmAdapter {
         : modelInfo(provider, configured),
       context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: DEFAULT_MAX_TOKENS,
+      ...reasoningInfo(undefined, undefined, true),
     })
   }
 

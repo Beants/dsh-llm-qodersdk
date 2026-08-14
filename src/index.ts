@@ -40,6 +40,12 @@ export function apply(ctx: Context, config: Config): void {
     modelCacheTtlMs: (config.modelCacheTtlSeconds ?? 300) * 1000,
   })
   ctx.llm.registerAdapter([QODER_PROVIDER], adapter)
+  // Declare the route in the configurable-provider directory so selection
+  // surfaces (the composer model seat, the Models settings page) render the
+  // Qoder group with its display name instead of an anonymous route.
+  ctx.llm.registerConfigurableProviders([
+    { provider: QODER_PROVIDER, displayName: 'Qoder CLI', settingsNs: 'llm-qoder', settingsPath: [] },
+  ])
   // registerAdapter's disposer only withdraws the routes; the warm qodercli
   // subprocesses are owned by the adapter and must close with the plugin.
   ctx.effect(() => () => adapter.close(), 'llm-qoder.sessions')

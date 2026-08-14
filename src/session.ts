@@ -167,6 +167,8 @@ export class QoderSession {
   private readonly registered = new Map<string, string>()
   private queue: TurnQueue | null = null
   private model: string
+  private reasoningEffort: string | undefined
+  private contextWindow: number | undefined
   private callCounter = 0
   private abortPending = false
   private disposed = false
@@ -203,7 +205,17 @@ export class QoderSession {
         canUseTool: gateTools as CanUseTool,
         settingSources: [],
         includePartialMessages: true,
-        resolveModel: () => ({ model: this.model }),
+        resolveModel: () => ({
+          model: this.model,
+          ...this.reasoningEffort === undefined && this.contextWindow === undefined
+            ? {}
+            : {
+              parameters: {
+                ...this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort },
+                ...this.contextWindow === undefined ? {} : { contextWindow: this.contextWindow },
+              },
+            },
+        }),
         mcpServers: { [MCP_SERVER_NAME]: this.mcp },
         allowedMcpServerNames: [MCP_SERVER_NAME],
         systemPrompt: { type: 'preset', preset: 'qodercli', append: renderIdentityAppend(this.hostSystem) },
@@ -214,8 +226,12 @@ export class QoderSession {
     return q
   }
 
-  /** Point the session at a model for the next turn (SDK re-resolves per request). */
-  setModel(model: string): void { this.model = model }
+  /** Point the session at a model and its per-request policy for the next turn. */
+  setModel(model: string, policy?: { reasoningEffort?: string, contextWindow?: number }): void {
+    this.model = model
+    this.reasoningEffort = policy?.reasoningEffort
+    this.contextWindow = policy?.contextWindow
+  }
 
   /** Record the host system prompt; effective only before the process spawns. */
   setSystem(system: string | undefined): void { this.hostSystem = system }

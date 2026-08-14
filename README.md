@@ -10,7 +10,8 @@
 - **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部。
 - **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对。
 - **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享，失败回退静态目录；另提供 `deepseek-v4-flash` / `deepseek-v4-pro` 别名。
-- **思考强度**：`resolveModel` 上报 CLI 的 reasoning efforts 与默认档位，产品模型选择器自动显示思考强度选项。
+- **思考强度**：`resolveModel` 上报 CLI 的 reasoning efforts 与默认档位，产品模型选择器自动显示思考强度选项；所选档位通过 model-policy 参数随每次请求下发。
+- **上下文窗口**：上报 CLI 的 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换上下文窗口（如 200K/400K/1M），并通过 model-policy 参数下发。
 - **旁路请求**：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。
 
 ## 安装

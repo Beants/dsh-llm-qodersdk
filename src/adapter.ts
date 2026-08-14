@@ -119,7 +119,15 @@ export class QoderAdapter extends LlmAdapter {
         name: live.displayName.length > 0 ? live.displayName : live.value,
         ...live.description.length > 0 ? { description: live.description } : {},
         inputModalities: ['text' as const],
-        context: { contextWindow: live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW },
+        context: {
+          contextWindow: live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW,
+          ...live.availableContextWindows !== undefined && live.availableContextWindows.length > 0
+            ? { availableContextWindows: live.availableContextWindows }
+            : {},
+          ...live.defaultContextWindow !== undefined
+            ? { defaultContextWindow: live.defaultContextWindow }
+            : {},
+        },
         defaultMaxTokens: live.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
         ...reasoning === undefined ? {} : { reasoning },
       }
@@ -145,9 +153,13 @@ export class QoderAdapter extends LlmAdapter {
       return
     }
     const sessionId = String(options.sessionId)
+    const policy = {
+      ...options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort },
+      ...options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow },
+    }
     let session = this.sessions.forSession(sessionId, model)
     if (session.fedMessages === undefined) {
-      yield* this.firstTurn(session, options, model)
+      yield* this.firstTurn(session, options, model, policy)
       return
     }
     session.deliverToolResults(options.messages.slice(session.fedMessages.length))
@@ -155,18 +167,23 @@ export class QoderAdapter extends LlmAdapter {
     if (plan.rebuild) {
       this.sessions.dispose(sessionId)
       session = this.sessions.forSession(sessionId, model)
-      yield* this.firstTurn(session, options, model)
+      yield* this.firstTurn(session, options, model, policy)
       return
     }
-    session.setModel(model)
+    session.setModel(model, policy)
     session.ensureTools(options.tools ?? [])
     session.fedMessages = options.messages
     session.fedSystem = options.system
     yield* session.stream(options, plan.feed)
   }
 
-  private async *firstTurn(session: QoderSession, options: GenerateOptions, model: string): AsyncGenerator<StreamChunk> {
-    session.setModel(model)
+  private async *firstTurn(
+    session: QoderSession,
+    options: GenerateOptions,
+    model: string,
+    policy: { reasoningEffort?: string, contextWindow?: number },
+  ): AsyncGenerator<StreamChunk> {
+    session.setModel(model, policy)
     session.setSystem(options.system)
     session.ensureTools(options.tools ?? [])
     session.fedMessages = options.messages

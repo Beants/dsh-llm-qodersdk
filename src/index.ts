@@ -40,4 +40,7 @@ export function apply(ctx: Context, config: Config): void {
     modelCacheTtlMs: (config.modelCacheTtlSeconds ?? 300) * 1000,
   })
   ctx.llm.registerAdapter([QODER_PROVIDER], adapter)
+  // registerAdapter's disposer only withdraws the routes; the warm qodercli
+  // subprocesses are owned by the adapter and must close with the plugin.
+  ctx.effect(() => () => adapter.close(), 'llm-qoder.sessions')
 }

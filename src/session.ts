@@ -12,16 +12,10 @@ import { CallId, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk, ToolSchema, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
-import { appendFileSync } from 'node:fs'
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
 import { renderIdentityAppend } from './render.ts'
-
-/** TEMP debug sink while the MCP tool wiring is being verified. */
-function dbg(message: string): void {
-  try { appendFileSync('/tmp/qoder-probe/adapter.log', `${new Date().toISOString()} ${message}\n`) } catch { /* ignore */ }
-}
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -179,7 +173,8 @@ export class QoderSession {
   /** Previous request's messages for delta feeding. */
   fedMessages: readonly Message[] | undefined
   fedSystem: string | undefined
-  fedChars = 0
+  /** This turn's fed characters, reset per turn for per-call token accounting. */
+  turnInputChars = 0
   /** Host system prompt captured before spawn for the boot-time systemPrompt. */
   private hostSystem: string | undefined
 
@@ -225,12 +220,11 @@ export class QoderSession {
   /** Record the host system prompt; effective only before the process spawns. */
   setSystem(system: string | undefined): void { this.hostSystem = system }
 
-  /** Register any host tools not yet known to this session's MCP server. */
+  /** Register any host tools whose schema this session's MCP server lacks. */
   ensureTools(tools: readonly ToolSchema[]): void {
-    dbg(`ensureTools session=${this.sessionId} count=${tools.length} started=${this.q !== null}`)
     for (const schema of tools) {
       const hash = JSON.stringify(schema.parameters ?? {})
-      if (this.registered.has(schema.name)) continue
+      if (this.registered.get(schema.name) === hash) continue
       const shape = jsonSchemaToShape(schema.parameters ?? {})
       try {
         this.mcp.instance.registerTool(schema.name, {
@@ -239,7 +233,6 @@ export class QoderSession {
         }, async (args: unknown): Promise<{ content: Array<{ type: 'text', text: string }>, isError?: boolean }> => {
           void args
           const callId = this.openCalls.shift()
-          dbg(`mcp handler INVOKED name=${schema.name} callId=${String(callId)} buffered=${callId !== undefined && this.pendingResults.has(callId)}`)
           let result: { text: string, isError: boolean }
           if (callId !== undefined && this.pendingResults.has(callId)) {
             result = this.pendingResults.get(callId) as { text: string, isError: boolean }
@@ -248,24 +241,22 @@ export class QoderSession {
             const key = callId ?? `anon-${this.callCounter}-${this.parked.size}`
             result = await new Promise<{ text: string, isError: boolean }>(resolve => { this.parked.set(key, resolve) })
           }
-          dbg(`mcp handler RESOLVED name=${schema.name} callId=${String(callId)} isError=${result.isError} chars=${result.text.length}`)
           return {
             content: [{ type: 'text', text: result.text }],
             ...result.isError ? { isError: true } : {},
           }
         })
-      } catch (error) {
-        dbg(`ensureTools REGISTER FAILED name=${schema.name} error=${String(error)}`)
+      } catch {
+        // Re-registration of a changed schema failed: keep the old tool rather
+        // than dropping it; nothing else can recover here.
         continue
       }
-      dbg(`ensureTools registered name=${schema.name}`)
       this.registered.set(schema.name, hash)
     }
   }
 
   /** Deliver host tool results to parked/buffered handlers, keyed by callId. */
   deliverToolResults(tail: readonly Message[]): void {
-    dbg(`deliverToolResults tail=${tail.length} parked=${this.parked.size} roles=${tail.map(m => `${m.role}:${m.source.kind}`).join(',')}`)
     let freshUserTurn = false
     for (const message of tail) {
       if (message.role === 'user' && message.source.kind !== 'tool') {
@@ -284,7 +275,6 @@ export class QoderSession {
       } else {
         this.pendingResults.set(callId, payload)
       }
-      dbg(`deliverToolResults ${callId} -> ${resolve !== undefined ? 'parked' : 'buffered'} isError=${payload.isError} chars=${payload.text.length}`)
     }
     // The host started a new user turn while calls were still parked: unstick
     // the inner process with an explicit cancellation result.
@@ -303,7 +293,7 @@ export class QoderSession {
     this.queue = new TurnQueue()
     this.resetTurnState()
     if (feed !== null) {
-      this.fedChars += feed.length
+      this.turnInputChars += feed.length
       this.channel.push({
         type: 'user',
         message: { role: 'user', content: [{ type: 'text', text: feed }] },
@@ -311,10 +301,12 @@ export class QoderSession {
       })
     }
     const signal = options.signal
+    let abortTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
       this.abortPending = true
       void q.interrupt()
-      setTimeout(() => this.endTurn({ kind: 'aborted', failure: { message: 'qoder session aborted by host', code: 'ABORTED' } }), 5_000)
+      // Fallback: end the turn if the inner process does not settle promptly.
+      abortTimer = setTimeout(() => this.endTurn({ kind: 'aborted', failure: { message: 'qoder session aborted by host', code: 'ABORTED' } }), 5_000)
     }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
@@ -329,6 +321,7 @@ export class QoderSession {
       }
     } finally {
       signal?.removeEventListener('abort', onAbort)
+      if (abortTimer !== undefined) clearTimeout(abortTimer)
       this.queue = null
       this.abortPending = false
     }
@@ -347,6 +340,7 @@ export class QoderSession {
     this.reasoningBlock = undefined
     this.openTool = undefined
     this.toolCalls = []
+    this.turnInputChars = 0
     this.outputChars = 0
     this.reasoningChars = 0
   }
@@ -355,7 +349,7 @@ export class QoderSession {
 
   private usage(): TokenUsage {
     return {
-      inputTokens: Math.max(1, Math.ceil(this.fedChars / 4)),
+      inputTokens: Math.max(1, Math.ceil(this.turnInputChars / 4)),
       outputTokens: Math.max(1, Math.ceil((this.outputChars + this.reasoningChars) / 4)),
       ...this.reasoningChars > 0 ? { reasoningTokens: Math.ceil(this.reasoningChars / 4) } : {},
     }
@@ -399,7 +393,6 @@ export class QoderSession {
         case 'content_block_start': {
           const block = event.content_block
           if (block?.type === 'tool_use') {
-            dbg(`tool_use from inner model name=${block.name ?? ''}`)
             const callId = `qoder-${++this.callCounter}`
             this.openCalls.push(callId)
             const chunkIndex = this.blockIndex++

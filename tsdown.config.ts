@@ -12,7 +12,8 @@ export default defineConfig({
   platform: 'node',
   target: 'es2024',
   dts: false,
-  clean: true,
+  // tsc emits lib/types/*.d.ts first; a clean pass would wipe them.
+  clean: false,
   external: [
     '@deepseek-ai/cordis',
     '@deepseek-ai/dsh-llm',

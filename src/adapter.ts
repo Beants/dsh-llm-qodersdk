@@ -18,12 +18,6 @@ import {
 import { DEFAULT_MODEL_CACHE_TTL_MS, QoderModelCatalog } from './models.ts'
 import { renderInitialFeed, renderRefreshed, renderUserTurn } from './render.ts'
 import { QoderSession, QoderSessionManager } from './session.ts'
-import { appendFileSync } from 'node:fs'
-
-/** TEMP debug sink while the MCP tool wiring is being verified. */
-function dbg(message: string): void {
-  try { appendFileSync('/tmp/qoder-probe/adapter.log', `${new Date().toISOString()} ${message}\n`) } catch { /* ignore */ }
-}
 
 /** Options for {@link QoderAdapter}. */
 export interface QoderAdapterOptions {
@@ -96,7 +90,6 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    dbg(`stream provider=${options.provider} model=${options.model} session=${String(options.sessionId ?? '<none>')} purpose=${String(options.purpose ?? '<none>')} tools=${options.tools?.length ?? 0} messages=${options.messages.length}`)
     const model = resolveQoderModelId(options.model)
     if (options.sessionId === undefined || options.purpose !== undefined) {
       const prompt = renderInitialFeed(options.system, options.messages)

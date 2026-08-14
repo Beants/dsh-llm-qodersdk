@@ -114,11 +114,21 @@ interface ToolUnderAssembly {
   arguments: string
 }
 
+/** Structural view of the SDK usage this consumer forwards to the harness. */
+interface SdkUsage {
+  input_tokens?: number | null
+  output_tokens?: number | null
+  cache_read_input_tokens?: number | null
+  cache_creation_input_tokens?: number | null
+}
+
 /** Structural view of the SDK stream events this consumer cares about. */
 interface SdkStreamEvent {
   type: string
   content_block?: { type?: string, id?: string, name?: string, input?: unknown }
   delta?: { type?: string, text?: string, thinking?: string, partial_json?: string }
+  usage?: SdkUsage
+  message?: { content?: unknown, usage?: SdkUsage }
 }
 
 /** Structural view of the SDK messages this consumer cares about. */
@@ -126,7 +136,8 @@ interface SdkMessage {
   type: string
   subtype?: string
   event?: SdkStreamEvent
-  message?: { content?: Array<{ type?: string, text?: string }> }
+  message?: { content?: Array<{ type?: string, text?: string }>, usage?: SdkUsage }
+  usage?: SdkUsage
   errors?: unknown
 }
 
@@ -204,6 +215,8 @@ export class QoderSession {
   private toolCalls: ToolUnderAssembly[] = []
   private outputChars = 0
   private reasoningChars = 0
+  /** Last real usage reported by the inner model for the active turn. */
+  private lastUsage: SdkUsage | undefined
 
   constructor(readonly sessionId: string, initialModel: string) {
     this.model = initialModel
@@ -421,11 +434,32 @@ export class QoderSession {
     // before this stream started.
     this.toolUseQueue.length = 0
     this.hostCallByToolUse.clear()
+    this.lastUsage = undefined
   }
 
   private emit(chunk: StreamChunk): void { this.queue?.push({ kind: 'chunk', chunk }) }
 
   private usage(): TokenUsage {
+    // Prefer the inner model's real metering when the stream reported it.
+    // The SDK's input_tokens includes cache reads/writes, so subtract them
+    // into disjoint buckets, matching the harness TokenUsage convention.
+    const real = this.lastUsage
+    // The qoder CLI's usage frames are zeroed by default (no metering data);
+    // an all-zero frame is not real usage, fall back to the character estimate.
+    if (real !== undefined
+      && typeof real.input_tokens === 'number'
+      && typeof real.output_tokens === 'number'
+      && (real.input_tokens > 0 || real.output_tokens > 0)) {
+      const cacheRead = typeof real.cache_read_input_tokens === 'number' ? real.cache_read_input_tokens : 0
+      const cacheWrite = typeof real.cache_creation_input_tokens === 'number' ? real.cache_creation_input_tokens : 0
+      return {
+        inputTokens: Math.max(0, real.input_tokens - cacheRead - cacheWrite),
+        outputTokens: real.output_tokens,
+        ...cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
+        ...cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {},
+        ...this.reasoningChars > 0 ? { reasoningTokens: Math.ceil(this.reasoningChars / 4) } : {},
+      }
+    }
     return {
       inputTokens: Math.max(1, Math.ceil(this.turnInputChars / 4)),
       outputTokens: Math.max(1, Math.ceil((this.outputChars + this.reasoningChars) / 4)),
@@ -467,6 +501,9 @@ export class QoderSession {
     if (message.type === 'stream_event') {
       const event = message.event
       if (event === undefined) return
+      // message_start / message_delta carry the running usage for the step.
+      if (event.usage !== undefined) this.lastUsage = event.usage
+      else if (event.message?.usage !== undefined) this.lastUsage = event.message.usage
       switch (event.type) {
         case 'content_block_start': {
           const block = event.content_block
@@ -556,6 +593,8 @@ export class QoderSession {
       return
     }
     if (message.type === 'assistant') {
+      // Fallback turns (no partial events) still carry the real usage.
+      if (message.message?.usage !== undefined) this.lastUsage = message.message.usage
       // Fallback for turns that streamed no partial events.
       if (this.textBlock === undefined && this.toolCalls.length === 0) {
         const text = (message.message?.content ?? [])
@@ -572,6 +611,9 @@ export class QoderSession {
       return
     }
     if (message.type === 'result') {
+      // The result frame carries the authoritative final usage (the stream
+      // events' usage is cumulative and often zeroed until the last delta).
+      if (message.usage !== undefined) this.lastUsage = message.usage
       if (this.abortPending) {
         this.endTurn({ kind: 'aborted', failure: { message: 'qoder turn aborted by host', code: 'ABORTED' } })
         return

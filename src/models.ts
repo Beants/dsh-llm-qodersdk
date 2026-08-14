@@ -1,7 +1,7 @@
 /**
  * Live model catalog retrieval from the local Qoder CLI. One short-lived
  * inner session sends the SDK's `get_models` control request; the response
- * (including account-custom BYOK models) stays fresh for a TTL, concurrent
+ * (including account-custom models) stays fresh for a TTL, concurrent
  * callers share one in-flight fetch, and the static catalog is the fallback
  * while the CLI is unreachable.
  * @module dsh-llm-qoder/models

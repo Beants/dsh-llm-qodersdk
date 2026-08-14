@@ -13,7 +13,7 @@ import type {
   ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk, ToolSchema, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
-import type { CanUseTool, CustomModel, Query } from '@qoder-ai/qoder-agent-sdk'
+import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
 import { renderIdentityAppend } from './render.ts'
 
@@ -185,8 +185,6 @@ export class QoderSession {
   private model: string
   private reasoningEffort: string | undefined
   private contextWindow: number | undefined
-  /** BYOK credential payload; when set, resolveModel routes calls through the external provider. */
-  private custom: (CustomModel & { model: string }) | undefined
   private callCounter = 0
   private abortPending = false
   private disposed = false
@@ -224,7 +222,7 @@ export class QoderSession {
         settingSources: [],
         includePartialMessages: true,
         resolveModel: () => ({
-          model: this.custom ?? this.model,
+          model: this.model,
           ...this.reasoningEffort === undefined && this.contextWindow === undefined
             ? {}
             : {
@@ -244,16 +242,14 @@ export class QoderSession {
     return q
   }
 
-  /** Point the session at a model, its per-request policy, and any BYOK credentials. */
+  /** Point the session at a model and its per-request policy. */
   setModel(
     model: string,
     policy?: { reasoningEffort?: string, contextWindow?: number },
-    custom?: CustomModel & { model: string },
   ): void {
     this.model = model
     this.reasoningEffort = policy?.reasoningEffort
     this.contextWindow = policy?.contextWindow
-    this.custom = custom
   }
 
   /** Record the host system prompt; effective only before the process spawns. */

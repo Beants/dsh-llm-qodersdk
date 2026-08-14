@@ -12,7 +12,7 @@ export interface QoderCatalogModel {
   id: string
   name: string
   description?: string
-  /** Where the model came from: `user` marks a qodercli BYOK (custom) model. */
+  /** Where the model came from: `user` marks a qodercli custom model. */
   source?: 'system' | 'user'
 }
 

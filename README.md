@@ -43,6 +43,12 @@
 | `src/render.ts` | 宿主消息 → 内层纯文本 feed；身份覆盖 |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape（MCP 工具注册用） |
 
+## 开发与构建
+
+本仓库只存源码（`src/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，发布时按需生成。
+
+构建在 DeepSeek Harness 仓库内进行（该插件的 `package.json` 原样保留在 `plugins/llm-qoder/` 下，由仓库根配置 `tsc` + `tsdown` 产出 `lib/`）。当前 `@deepseek-ai/dsh-llm@^0.1.0-rc.5` 尚未发布到公共 npm（registry 上仅有 `0.0.1-rc.1`），因此在独立环境直接 `npm install` / 构建暂不可行；等依赖发布后再补齐独立的构建配置。
+
 ## License
 
 [MIT](LICENSE) © 2026 dsh-llm-qodersdk contributors

@@ -15,6 +15,9 @@ import type {
 import {
   DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, QODER_MODELS, resolveQoderModelId,
 } from './catalog.ts'
+import {
+  ByokModelConfig, byokEntryFor, byokModelId, customModelFor, parseByokModelId, QoderByokCatalog,
+} from './byok.ts'
 import { DEFAULT_MODEL_CACHE_TTL_MS, QoderModelCatalog } from './models.ts'
 import { renderInitialFeed, renderRefreshed, renderUserTurn } from './render.ts'
 import { QoderSession, QoderSessionManager } from './session.ts'
@@ -25,10 +28,14 @@ export interface QoderAdapterOptions {
   maxSessions?: number
   /** How long a fetched CLI model catalog stays fresh (default 5 min). */
   modelCacheTtlMs?: number
+  /** Live view of the configured BYOK (external model) entries. */
+  byokModels?: () => readonly ByokModelConfig[]
 }
 
-/** The single provider route this adapter owns. */
+/** The primary provider route (the qoder account's built-in models). */
 export const QODER_PROVIDER = 'qoder'
+/** Secondary route advertising only the account's BYOK (custom) models. */
+export const QODER_BYOK_PROVIDER = 'qoder-byok'
 
 function modelInfo(provider: string, entry: { id: string, name: string, description?: string }): LlmModelInfo {
   return {
@@ -90,19 +97,62 @@ function reasoningInfo(
 export class QoderAdapter extends LlmAdapter {
   private readonly sessions: QoderSessionManager
   private readonly catalog: QoderModelCatalog
+  private readonly byokCatalog: QoderByokCatalog
+  private readonly byokModels: () => readonly ByokModelConfig[]
 
   constructor(options: QoderAdapterOptions = {}) {
     super()
     this.sessions = new QoderSessionManager(options.maxSessions ?? 8)
     this.catalog = new QoderModelCatalog(options.modelCacheTtlMs ?? DEFAULT_MODEL_CACHE_TTL_MS)
+    this.byokCatalog = new QoderByokCatalog(options.modelCacheTtlMs ?? DEFAULT_MODEL_CACHE_TTL_MS)
+    this.byokModels = options.byokModels ?? (() => [])
+  }
+
+  /** Live BYOK configuration; absent until the plugin wires its settings section. */
+  private byokEntries(): readonly ByokModelConfig[] {
+    return this.byokModels()
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'Qoder CLI' }
+    return {
+      id: provider,
+      name: provider === QODER_BYOK_PROVIDER ? 'Qoder 自定义' : 'Qoder CLI',
+    }
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return (await this.catalog.models()).map(entry => modelInfo(provider, entry))
+    const cliModels = await this.catalog.models()
+    if (provider === QODER_BYOK_PROVIDER) {
+      // Only the account's custom (BYOK) models, plus any plugin-configured
+      // BYOK entries (byok:<provider>:<model>).
+      const custom = cliModels
+        .filter(entry => entry.source === 'user')
+        .map(entry => modelInfo(provider, entry))
+      const configured = await this.byokModelInfos(provider)
+      return [...custom, ...configured]
+    }
+    // The built-in route lists the qoder account's own models, excluding the
+    // BYOK models that have their own route.
+    const builtin = cliModels
+      .filter(entry => entry.source !== 'user')
+      .map(entry => modelInfo(provider, entry))
+    return builtin
+  }
+
+  /** One picker entry per configured BYOK model, enriched from the live catalog. */
+  private async byokModelInfos(provider: string): Promise<readonly LlmModelInfo[]> {
+    const entries = this.byokEntries()
+    if (entries.length === 0) return []
+    return Promise.all(entries.map(async (entry) => {
+      const info = await this.byokCatalog.find(entry.provider, entry.model)
+      return {
+        provider,
+        id: byokModelId(entry.provider, entry.model),
+        name: entry.name ?? info?.display_name ?? `${entry.model} (${entry.provider})`,
+        ...info !== undefined && info.display_name.length > 0 ? { description: `BYOK · ${info.display_name}` } : {},
+        inputModalities: ['text' as const],
+      }
+    }))
   }
 
   override async resolveModel(
@@ -110,6 +160,23 @@ export class QoderAdapter extends LlmAdapter {
     model: string,
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
+    const parsed = parseByokModelId(model)
+    if (parsed !== undefined) {
+      const entry = this.byokEntries().find(candidate =>
+        candidate.provider === parsed.provider && candidate.model === parsed.model)
+      const info = await this.byokCatalog.find(parsed.provider, parsed.model)
+      const reasoning = reasoningInfo(info?.efforts, info?.efforts?.[0], info?.is_reasoning)
+      return {
+        provider,
+        id: model,
+        name: entry?.name ?? info?.display_name ?? `${parsed.model} (${parsed.provider})`,
+        ...info !== undefined && info.display_name.length > 0 ? { description: `BYOK · ${info.display_name}` } : {},
+        inputModalities: ['text' as const],
+        ...info !== undefined ? { context: { contextWindow: info.max_input_tokens } } : {},
+        defaultMaxTokens: DEFAULT_MAX_TOKENS,
+        ...reasoning === undefined ? {} : { reasoning },
+      }
+    }
     const live = (await this.catalog.liveModels()).find(entry => entry.value === model)
     if (live !== undefined) {
       const reasoning = reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning)
@@ -146,10 +213,13 @@ export class QoderAdapter extends LlmAdapter {
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const model = resolveQoderModelId(options.model)
+    const custom = byokCustomFor(this.byokEntries(), options.model)
     if (options.sessionId === undefined || options.purpose !== undefined) {
       const prompt = renderInitialFeed(options.system, options.messages)
         + '\n（这是一次性旁路请求，直接输出下一条助手回复。）'
-      yield* this.sessions.coldStream(options, prompt, model)
+      // Side channels cannot carry a per-call custom_model; let qodercli use
+      // its own default model for one-shot titles/compactions.
+      yield* this.sessions.coldStream(options, prompt, custom !== undefined ? undefined : model)
       return
     }
     const sessionId = String(options.sessionId)
@@ -159,7 +229,7 @@ export class QoderAdapter extends LlmAdapter {
     }
     let session = this.sessions.forSession(sessionId, model)
     if (session.fedMessages === undefined) {
-      yield* this.firstTurn(session, options, model, policy)
+      yield* this.firstTurn(session, options, model, policy, custom)
       return
     }
     session.deliverToolResults(options.messages.slice(session.fedMessages.length))
@@ -167,10 +237,10 @@ export class QoderAdapter extends LlmAdapter {
     if (plan.rebuild) {
       this.sessions.dispose(sessionId)
       session = this.sessions.forSession(sessionId, model)
-      yield* this.firstTurn(session, options, model, policy)
+      yield* this.firstTurn(session, options, model, policy, custom)
       return
     }
-    session.setModel(model, policy)
+    session.setModel(model, policy, custom)
     session.ensureTools(options.tools ?? [])
     session.fedMessages = options.messages
     session.fedSystem = options.system
@@ -182,8 +252,9 @@ export class QoderAdapter extends LlmAdapter {
     options: GenerateOptions,
     model: string,
     policy: { reasoningEffort?: string, contextWindow?: number },
+    custom?: import('@qoder-ai/qoder-agent-sdk').CustomModel & { model: string },
   ): AsyncGenerator<StreamChunk> {
-    session.setModel(model, policy)
+    session.setModel(model, policy, custom)
     session.setSystem(options.system)
     session.ensureTools(options.tools ?? [])
     session.fedMessages = options.messages
@@ -191,10 +262,19 @@ export class QoderAdapter extends LlmAdapter {
     yield* session.stream(options, renderInitialFeed(options.system, options.messages))
   }
 
-  /** Tear down every warm inner session (plugin dispose). */
+/** Tear down every warm inner session (plugin dispose). */
   close(): void {
     this.sessions.closeAll()
   }
+}
+
+/** The per-call BYOK credential payload for the selected model, if configured. */
+function byokCustomFor(
+  entries: readonly ByokModelConfig[],
+  model: string,
+): import('@qoder-ai/qoder-agent-sdk').CustomModel & { model: string } | undefined {
+  const entry = byokEntryFor(entries, model)
+  return entry === undefined ? undefined : customModelFor(entry)
 }
 
 interface ContinuationPlan {

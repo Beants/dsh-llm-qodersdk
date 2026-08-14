@@ -13,7 +13,7 @@ import type {
   ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk, ToolSchema, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
-import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
+import type { CanUseTool, CustomModel, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
 import { renderIdentityAppend } from './render.ts'
 
@@ -21,6 +21,9 @@ import { renderIdentityAppend } from './render.ts'
 export const MCP_SERVER_NAME = 'dsh-host'
 /** Prefix qodercli uses for this server's tools inside `canUseTool`. */
 const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
+
+/** How long an MCP tool handler waits for the host tool result before failing the call. */
+const TOOL_RESULT_TIMEOUT_MS = 120_000
 
 interface ChannelMessage {
   type: 'user'
@@ -94,6 +97,11 @@ class TurnQueue implements AsyncIterable<QueueItem> {
       },
     }
   }
+
+  /** Whether the turn already ended; late pushes are dropped. */
+  get isClosed(): boolean {
+    return this.closed
+  }
 }
 
 interface ParkedResolver { (result: { text: string, isError: boolean }): void }
@@ -141,6 +149,9 @@ async function gateTools(toolName: string, _input: unknown, options: { toolUseID
   }
 }
 
+/** The SDK permission callback shape this adapter implements per session. */
+type SessionCanUseTool = (toolName: string, input: Record<string, unknown>, options: { toolUseID?: string }) => Promise<unknown>
+
 /**
  * One warm inner session. All mutation happens on the consumer fiber except
  * the documented turn lifecycle driven by {@link stream}.
@@ -154,21 +165,28 @@ export class QoderSession {
    */
   private q: Query | null = null
   /**
-   * Tool-call pairing state. qodercli executes calls one at a time and only
-   * invokes the NEXT handler after the previous MCP round trip completes,
-   * while the host delivers ALL results of a turn up front on the next
-   * request — so results buffer by callId and handlers claim their callId
-   * from the emission-order queue when they fire.
+   * Tool-call pairing state. qodercli asks `canUseTool` (with the qodercli
+   * tool-use id) once per call in execution order, then sends the MCP message;
+   * the host sees tool calls as content blocks and delivers all results up
+   * front on the next request. Tool-use ids therefore arrive in the handler in
+   * canUseTool order, and host callIds map back to them via the content-block
+   * ids — so handlers park under the exact tool-use id, never a shifted FIFO
+   * slot. Results buffer by tool-use id until their handler fires.
    */
   private readonly parked = new Map<string, ParkedResolver>()
   private readonly pendingResults = new Map<string, { text: string, isError: boolean }>()
-  private readonly openCalls: string[] = []
+  /** qodercli tool-use ids in canUseTool (execution) order, claimed by MCP handlers. */
+  private readonly toolUseQueue: string[] = []
+  /** Host callId (qoder-N) → qodercli tool-use id, from the content-block ids. */
+  private readonly hostCallByToolUse = new Map<string, string>()
   private readonly mcp = createSdkMcpServer({ name: MCP_SERVER_NAME, tools: [] })
   private readonly registered = new Map<string, string>()
   private queue: TurnQueue | null = null
   private model: string
   private reasoningEffort: string | undefined
   private contextWindow: number | undefined
+  /** BYOK credential payload; when set, resolveModel routes calls through the external provider. */
+  private custom: (CustomModel & { model: string }) | undefined
   private callCounter = 0
   private abortPending = false
   private disposed = false
@@ -202,11 +220,11 @@ export class QoderSession {
         auth: qodercliAuth(),
         tools: [],
         allowedTools: [],
-        canUseTool: gateTools as CanUseTool,
+        canUseTool: this.canUseTool as CanUseTool,
         settingSources: [],
         includePartialMessages: true,
         resolveModel: () => ({
-          model: this.model,
+          model: this.custom ?? this.model,
           ...this.reasoningEffort === undefined && this.contextWindow === undefined
             ? {}
             : {
@@ -226,15 +244,38 @@ export class QoderSession {
     return q
   }
 
-  /** Point the session at a model and its per-request policy for the next turn. */
-  setModel(model: string, policy?: { reasoningEffort?: string, contextWindow?: number }): void {
+  /** Point the session at a model, its per-request policy, and any BYOK credentials. */
+  setModel(
+    model: string,
+    policy?: { reasoningEffort?: string, contextWindow?: number },
+    custom?: CustomModel & { model: string },
+  ): void {
     this.model = model
     this.reasoningEffort = policy?.reasoningEffort
     this.contextWindow = policy?.contextWindow
+    this.custom = custom
   }
 
   /** Record the host system prompt; effective only before the process spawns. */
   setSystem(system: string | undefined): void { this.hostSystem = system }
+
+  /**
+   * Permission gate for the inner process. Native tools are denied; MCP host
+   * tools are allowed, and each allowed call's qodercli tool-use id is queued
+   * so the matching MCP handler can park under the exact id (qodercli asks
+   * once per call, in execution order, before sending the MCP message).
+   */
+  private canUseTool: SessionCanUseTool = (toolName, _input, options) => {
+    if (toolName.startsWith(MCP_TOOL_PREFIX)) {
+      if (options.toolUseID !== undefined) this.toolUseQueue.push(options.toolUseID)
+      return Promise.resolve({ behavior: 'allow', ...options.toolUseID === undefined ? {} : { toolUseID: options.toolUseID } })
+    }
+    return Promise.resolve({
+      behavior: 'deny',
+      message: '本会话是宿主 agent 的 LLM 后端，不直接执行工具。宿主的工具已通过 MCP 挂入，直接调用它们即可。',
+      ...options.toolUseID === undefined ? {} : { toolUseID: options.toolUseID },
+    })
+  }
 
   /** Register any host tools whose schema this session's MCP server lacks. */
   ensureTools(tools: readonly ToolSchema[]): void {
@@ -248,14 +289,30 @@ export class QoderSession {
           inputSchema: shape,
         }, async (args: unknown): Promise<{ content: Array<{ type: 'text', text: string }>, isError?: boolean }> => {
           void args
-          const callId = this.openCalls.shift()
+          const toolUseId = this.toolUseQueue.shift()
           let result: { text: string, isError: boolean }
-          if (callId !== undefined && this.pendingResults.has(callId)) {
-            result = this.pendingResults.get(callId) as { text: string, isError: boolean }
-            this.pendingResults.delete(callId)
+          if (toolUseId !== undefined && this.pendingResults.has(toolUseId)) {
+            result = this.pendingResults.get(toolUseId) as { text: string, isError: boolean }
+            this.pendingResults.delete(toolUseId)
           } else {
-            const key = callId ?? `anon-${this.callCounter}-${this.parked.size}`
-            result = await new Promise<{ text: string, isError: boolean }>(resolve => { this.parked.set(key, resolve) })
+            const key = toolUseId ?? `anon-${this.callCounter}-${this.parked.size}`
+            // Bounded park: a tool-use id the host never delivers must not
+            // leave the inner process waiting forever. On timeout the call
+            // fails with an error so qodercli's loop recovers instead of
+            // deadlocking.
+            result = await new Promise<{ text: string, isError: boolean }>(resolve => {
+              const timer = setTimeout(() => {
+                this.parked.delete(key)
+                resolve({
+                  text: `宿主在 ${TOOL_RESULT_TIMEOUT_MS / 1000}s 内未返回工具结果（toolUseId=${key}），本次工具调用已取消`,
+                  isError: true,
+                })
+              }, TOOL_RESULT_TIMEOUT_MS)
+              this.parked.set(key, payload => {
+                clearTimeout(timer)
+                resolve(payload)
+              })
+            })
           }
           return {
             content: [{ type: 'text', text: result.text }],
@@ -284,12 +341,16 @@ export class QoderSession {
       if (block === undefined || block.type !== 'tool-result') continue
       const callId = String(block.toolCallId)
       const payload = { text: renderResultText(block.content), isError: block.isError === true }
-      const resolve = this.parked.get(callId)
+      // Key by the qodercli tool-use id the host callId maps to; without a
+      // mapping (a call the host never surfaced) fall back to the callId so
+      // the entry still buffers for any handler that parked under it.
+      const key = this.hostCallByToolUse.get(callId) ?? callId
+      const resolve = this.parked.get(key)
       if (resolve !== undefined) {
-        this.parked.delete(callId)
+        this.parked.delete(key)
         resolve(payload)
       } else {
-        this.pendingResults.set(callId, payload)
+        this.pendingResults.set(key, payload)
       }
     }
     // The host started a new user turn while calls were still parked: unstick
@@ -359,6 +420,11 @@ export class QoderSession {
     this.turnInputChars = 0
     this.outputChars = 0
     this.reasoningChars = 0
+    // Pairing state is per turn: canUseTool ids are claimed by handlers within
+    // the turn, and host callId mappings were consumed by deliverToolResults
+    // before this stream started.
+    this.toolUseQueue.length = 0
+    this.hostCallByToolUse.clear()
   }
 
   private emit(chunk: StreamChunk): void { this.queue?.push({ kind: 'chunk', chunk }) }
@@ -409,8 +475,15 @@ export class QoderSession {
         case 'content_block_start': {
           const block = event.content_block
           if (block?.type === 'tool_use') {
+            // Only host-visible tool calls may be emitted: blocks that arrive
+            // while no host stream is active can never be delivered, and their
+            // canUseTool/handler sequence is paired by tool-use id anyway, so
+            // skipping them keeps the host transcript consistent.
+            if (this.queue === null || this.queue.isClosed) break
             const callId = `qoder-${++this.callCounter}`
-            this.openCalls.push(callId)
+            if (typeof block.id === 'string' && block.id.length > 0) {
+              this.hostCallByToolUse.set(callId, block.id)
+            }
             const chunkIndex = this.blockIndex++
             this.openTool = {
               chunkIndex,
@@ -590,7 +663,7 @@ export class QoderSessionManager {
   }
 
   /** One-shot turn with no warm state: side channels and cold rebuilds. */
-  async *coldStream(options: GenerateOptions, prompt: string, model: string): AsyncGenerator<StreamChunk> {
+  async *coldStream(options: GenerateOptions, prompt: string, model?: string): AsyncGenerator<StreamChunk> {
     const q = query({
       prompt,
       options: {
@@ -600,7 +673,7 @@ export class QoderSessionManager {
         canUseTool: gateTools as CanUseTool,
         settingSources: [],
         maxTurns: 4,
-        model,
+        ...model === undefined ? {} : { model },
       },
     })
     const signal = options.signal

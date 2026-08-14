@@ -53,6 +53,7 @@ export class QoderModelCatalog {
       id: model.value,
       name: model.displayName.length > 0 ? model.displayName : model.value,
       ...model.description.length > 0 ? { description: model.description } : {},
+      ...model.source === undefined ? {} : { source: model.source },
     }))
   }
 

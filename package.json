@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-llm-qoder",
   "description": "Qoder CLI (qoder-agent-sdk) adapter for the DeepSeek Harness LLM seam",
-  "version": "0.1.5",
+  "version": "0.1.9",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -28,10 +28,11 @@
     "url": "https://github.com/JiamingZang/dsh-llm-qodersdk.git"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-settings": "0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@qoder-ai/qoder-agent-sdk": "^1.0.21",
     "zod": "^4.4.3"

@@ -12,6 +12,8 @@ export interface QoderCatalogModel {
   id: string
   name: string
   description?: string
+  /** Where the model came from: `user` marks a qodercli BYOK (custom) model. */
+  source?: 'system' | 'user'
 }
 
 /** Default combined context capacity assumed for Qoder-backed models. */

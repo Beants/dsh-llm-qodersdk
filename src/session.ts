@@ -18,7 +18,7 @@ import type {
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
-import { renderIdentityAppend } from './render.ts'
+import { renderIdentityAppend, renderInitialFeed } from './render.ts'
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -220,6 +220,14 @@ export class QoderSession {
   private reasoningChars = 0
   /** Last real usage reported by the inner model for the active turn. */
   private lastUsage: SdkUsage | undefined
+  /**
+   * Session-level input token estimate for the CURRENT request, priced the
+   * same way the harness token meter prices the surface (4 chars per token
+   * on the rendered conversation the inner session actually receives). The
+   * qoder CLI zeroes its per-stream usage frames, so without this the harness
+   * context meter would read ~0% and auto-compaction would never trigger.
+   */
+  private estimatedInputTokens: number | undefined
 
   constructor(readonly sessionId: string, initialModel: string) {
     this.model = initialModel
@@ -404,7 +412,9 @@ export class QoderSession {
           yield item.chunk
           continue
         }
-        if (item.usage !== undefined) yield { type: 'usage', usage: item.usage }
+        if (item.usage !== undefined) {
+          yield { type: 'usage', usage: this.usage() }
+        }
         yield { type: 'finish', reason: item.reason }
         return
       }
@@ -443,12 +453,21 @@ export class QoderSession {
   private emit(chunk: StreamChunk): void { this.queue?.push({ kind: 'chunk', chunk }) }
 
   private usage(): TokenUsage {
-    // Prefer the inner model's real metering when the stream reported it.
+    // The qoder CLI's per-stream usage frames are zeroed by default (no
+    // metering data). Prefer our session-level estimate of the actual request
+    // input — priced like the harness token meter (4 chars/token over the
+    // rendered conversation) — so the harness context meter and compaction
+    // thresholds reflect the real occupancy instead of ~0.
+    if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
+      return {
+        inputTokens: this.estimatedInputTokens,
+        outputTokens: Math.max(1, Math.ceil((this.outputChars + this.reasoningChars) / 4)),
+        ...this.reasoningChars > 0 ? { reasoningTokens: Math.ceil(this.reasoningChars / 4) } : {},
+      }
+    }
+    const real = this.lastUsage
     // The SDK's input_tokens includes cache reads/writes, so subtract them
     // into disjoint buckets, matching the harness TokenUsage convention.
-    const real = this.lastUsage
-    // The qoder CLI's usage frames are zeroed by default (no metering data);
-    // an all-zero frame is not real usage, fall back to the character estimate.
     if (real !== undefined
       && typeof real.input_tokens === 'number'
       && typeof real.output_tokens === 'number'
@@ -468,6 +487,18 @@ export class QoderSession {
       outputTokens: Math.max(1, Math.ceil((this.outputChars + this.reasoningChars) / 4)),
       ...this.reasoningChars > 0 ? { reasoningTokens: Math.ceil(this.reasoningChars / 4) } : {},
     }
+  }
+
+  /**
+   * Record the input-token estimate for the CURRENT request, priced the same
+   * way the harness token meter prices the surface: 4 chars per token over
+   * the rendered conversation (system + messages) the inner session receives.
+   * @param system - the host system prompt included in this request.
+   * @param messages - the full host message list included in this request.
+   */
+  recordRequestInput(system: string | undefined, messages: readonly Message[]): void {
+    const rendered = renderInitialFeed(system, messages)
+    this.estimatedInputTokens = Math.max(1, Math.ceil(rendered.length / 4))
   }
 
   private endTurn(reason: FinishReason, usage?: TokenUsage): void {

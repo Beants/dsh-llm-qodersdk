@@ -136,7 +136,16 @@ export class QoderAdapter extends LlmAdapter {
         ...live.description.length > 0 ? { description: live.description } : {},
         inputModalities: ['text' as const],
         context: {
-          contextWindow: live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW,
+          // The compaction engine and context meter price against the window
+          // a request actually uses. qodercli reports maxInputTokens as the
+          // model's CEILING (often 1M) while defaultContextWindow is the
+          // effective per-session window (e.g. 200K); using the ceiling would
+          // push the auto-compaction threshold far past what the provider
+          // accepts. Prefer the default window, keeping the ceiling visible
+          // through availableContextWindows.
+          contextWindow: live.defaultContextWindow
+            ?? live.maxInputTokens
+            ?? DEFAULT_CONTEXT_WINDOW,
           ...live.availableContextWindows !== undefined && live.availableContextWindows.length > 0
             ? { availableContextWindows: live.availableContextWindows }
             : {},
@@ -165,9 +174,11 @@ export class QoderAdapter extends LlmAdapter {
     if (options.sessionId === undefined || options.purpose !== undefined) {
       const prompt = renderInitialFeed(options.system, options.messages)
         + '\n（这是一次性旁路请求，直接输出下一条助手回复。）'
-      // Side channels cannot carry a per-call custom_model; let qodercli use
-      // its own default model for one-shot titles/compactions.
-      yield* this.sessions.coldStream(options, prompt, undefined)
+      // Side channels (titles, compaction summaries) reuse the main session's
+      // model so dsh's recorded summarization target matches what qodercli
+      // actually runs — a different default route could have different
+      // context limits or quota, silently failing the compaction.
+      yield* this.sessions.coldStream(options, prompt, model)
       return
     }
     const sessionId = String(options.sessionId)
@@ -190,6 +201,7 @@ export class QoderAdapter extends LlmAdapter {
     }
     session.setModel(model, policy)
     session.ensureTools(options.tools ?? [])
+    session.recordRequestInput(options.system, options.messages)
     session.fedMessages = options.messages
     session.fedSystem = options.system
     yield* session.stream(options, plan.feed)
@@ -204,6 +216,7 @@ export class QoderAdapter extends LlmAdapter {
     session.setModel(model, policy)
     session.setSystem(options.system)
     session.ensureTools(options.tools ?? [])
+    session.recordRequestInput(options.system, options.messages)
     session.fedMessages = options.messages
     session.fedSystem = options.system
     yield* session.stream(options, renderInitialFeed(options.system, options.messages))

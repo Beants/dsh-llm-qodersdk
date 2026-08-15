@@ -1,19 +1,19 @@
-# dsh-llm-qodersdk
+# dsh-llm-qoder
 
 将 DeepSeek Harness 的 LLM 接缝（`ctx.llm`）路由到本机 **Qoder CLI** 的适配器插件（`@deepseek-ai/dsh-llm-qoder`），基于 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk)。
 
-它注册 `qoder` provider 路由，让 harness 的模型请求复用本机 `qodercli` 的登录态——**无需任何凭据或设置项**，包括账号自定义的 BYOK 模型。
+插件注册 `qoder` 与 `qoder-byok` 两个 provider 路由，让 harness 的模型请求复用本机 `qodercli` 的登录态——**无需任何凭据或设置项**。
 
 ## 特性
 
 - **无配置接入**：完全复用本机 `qodercli` 登录态，不需要 API key 或 settings 段。
-- **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部。
-- **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对。
-- **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享，失败回退静态目录；另提供 `deepseek-v4-flash` / `deepseek-v4-pro` 别名。
-- **思考强度**：`resolveModel` 上报 CLI 的 reasoning efforts 与默认档位，产品模型选择器自动显示思考强度选项；所选档位通过 model-policy 参数随每次请求下发。
-- **上下文窗口**：上报 CLI 的 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换上下文窗口（如 200K/400K/1M），并通过 model-policy 参数下发。
-- **BYOK 外部模型**：把 qodercli 的 BYOK（Bring Your Own Key）配置暴露为原生 harness 设置项——在 Models 设置页填写第三方 provider、模型、API key 即可把外部模型加入模型选择器，调用时凭据按请求经 qodercli 透传，不需要存入 harness。
+- **双路由**：`qoder` 广告账号内置模型；`qoder-byok` 只广告账号自定义模型（各自独立路由）。
+- **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部；`maxSessions` 上限内按插入序 LRU 淘汰。
+- **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对（120s 内未回传则超时取消）。
+- **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享 + 超时保护，失败回退静态目录；另提供 `deepseek-v4-flash` → `dfmodel`、`deepseek-v4-pro` → `dmodel` 别名。
+- **思考强度与上下文窗口**：`resolveModel` 上报 CLI 的 reasoning efforts、默认档位与 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换；所选值随每次请求下发。
 - **旁路请求**：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。
+- **溢出可恢复**：内层模型因上下文超限失败时（如 `maximum context length ... you requested N tokens`），按 dsh-llm 的 `isContextWindowExceededError` 分类为 `CONTEXT_WINDOW_EXCEEDED` 上报，harness 的溢出自动恢复（配合 `compaction-basic`）可以接管而不是让轮次直接报废。
 
 ## 安装
 
@@ -33,53 +33,49 @@
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | 同时保持 warm 的内层 qodercli 会话上限（超出按插入序 LRU 淘汰） |
 | `modelCacheTtlSeconds` | number | `300` | CLI 模型目录的缓存保鲜秒数 |
-| `byok` | `ByokModelConfig[]` | `[]` | 外部模型列表（见下文 BYOK 小节） |
 
-### BYOK 外部模型
+## 上下文管理与压缩
 
-qodercli 的 BYOK 能力允许用你自己的第三方 API key 调用外部模型（如阿里云百炼、Kimi、MiniMax 等）。本插件把它暴露为 **Models 设置页**里 `qoder` provider 下的一个表单：每填一条 `byok` 配置，就会在模型选择器里出现一个 `byok:<provider>:<model>` 模型。
+warm 内层会话会累积整段宿主历史：首轮喂入全量历史（`renderInitialFeed`），之后每轮只喂增量（新用户消息、原位刷新）。内层上下文因此随对话增长，模型有硬上限（如 1048576 tokens）。
 
-```ts
-interface ByokModelConfig {
-  provider: string   // 第三方 provider 标识，如 "bailian"、"kimi"、"deepseek"
-  model: string      // 外部模型标识，如 "qwen3.8-max-tp"
-  name?: string      // 选择器里显示的名字（默认取 model）
-  apiKey: string     // 你的第三方 API key，按请求经 qodercli 透传，不落盘到 harness
-  url?: string       // 可选：覆盖 provider 的 API 地址
-  style?: string     // 可选：协议风格，默认 "openai"
-}
-```
+- **溢出自动恢复**：内层模型报上下文超限时，插件上报 `CONTEXT_WINDOW_EXCEEDED`。harness 的溢出恢复（`dsh-compaction-basic` 的 `agent/request-error` 处理器）会压缩宿主历史并重试；压缩后宿主历史变短，下个请求插件检测到历史回退，自动重建内层会话、冷喂压缩后的历史。
+- **前提**：部署里必须加载 `dsh-compaction-basic`（`auto` 默认 `true`）和 `dsh-token-meter`。没装压缩插件时，超限轮次仍会失败——只能新开会话或手动压缩。
+- **建议把压力阈值调低**：默认 `thresholdRatio` 0.8 × 模型 contextWindow（1048576 → 约 838k）可能偏晚，尤其宿主侧 token 估算与内层真实用量有偏差时。建议调低到 0.6，让压力压缩远早于溢出触发：
 
-- **可用 provider 清单**：插件实时向 qodercli 查询 `get_byok_config`，返回约 12 个内置 provider（bailian、bailian-intl、zhipu、kimi、minimax、deepseek 等）及每个 provider 支持的模型元数据（`max_input_tokens`、思考档位、是否视觉/推理模型）。providers 与模型元数据通过 `QoderByokCatalog` 缓存。
-- **凭据安全**：API key 只随每次调用作为 `custom_model` 参数传给 qodercli，由 qodercli 的 worker 完成请求；harness 侧不存储、不落盘。
-- **编程接口**：包还导出 `fetchByokProviders()`、`validateByokModel({provider, model, api_key, url?, style?})`（无效 key 返回 `false`）、`byokModelId(provider, model)` / `parseByokModelId(id)`、`customModelFor(entry)` 与 `QoderByokCatalog`，便于在自己的代码里复用同一套逻辑。
+  ```yaml
+  - id: compaction-basic
+    config:
+      auto: true
+      thresholdRatio: 0.6
+      retainRatio: 0.16
+  ```
+
+  也可用 `modelPolicies` 给 `qoder` 路由单独配置。
+- **手动压缩**：加载 `dsh-command-compact` 后，对话中输入 `/compact` 立即压缩一次。
+- **已超限的会话**：历史已经超过模型上限时，"继续"只会带着更长历史重试失败；先 `/compact` 压缩（或调低阈值后等压力压缩触发），否则新开会话。
 
 ## 源码结构
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口：`ctx.llm.registerAdapter(['qoder'], adapter)` |
-| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成，warm 会话管理与续轮规划 |
-| `src/session.ts` | `QoderSession`：内层 `query()` 子进程、MCP 工具桥、SDK 流事件 → harness `StreamChunk` |
+| `src/index.ts` | 插件入口：注册 `qoder` / `qoder-byok` 路由、配置化 provider 目录与 settings 段 |
+| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成，warm 会话管理与续轮规划（`planContinuation`） |
+| `src/session.ts` | `QoderSession`：内层 `query()` 子进程、MCP 工具桥、SDK 流事件 → harness `StreamChunk`、失败分类 |
 | `src/models.ts` | 实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退） |
-| `src/byok.ts` | BYOK 外部模型：qodercli providers 目录、校验、`byok:` 模型 id 编解码与设置表单映射 |
 | `src/catalog.ts` | 静态模型表与 `deepseek-v4-*` 别名 |
 | `src/render.ts` | 宿主消息 → 内层纯文本 feed；身份覆盖 |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape（MCP 工具注册用） |
 
 ## 开发与构建
 
-本仓库只存源码（`src/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，由构建脚本按需生成。
-
 ```sh
 npm install
 npm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
+npm pack        # 生成 deepseek-ai-dsh-llm-qoder-<version>.tgz
 npm publish     # prepublishOnly 自动先构建
 ```
 
-构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
-
-> **当前限制**：`@deepseek-ai/dsh-llm@^0.1.0-rc.5` 尚未发布到公共 npm（registry 上仅有 `0.0.1-rc.1`），因此 `npm install` 暂时无法解析该 peer 依赖，独立构建也暂不可运行。等它发布后，本仓库即可直接 `npm install && npm run build && npm publish`。在此之前，实际构建/使用仍在 DeepSeek Harness 仓库内的 `plugins/llm-qoder/` 完成（由仓库根配置 `tsc` + `tsdown` 产出 `lib/`）。
+peer 依赖 `@deepseek-ai/dsh-llm`（`^0.1.0-rc.5`）与 `@deepseek-ai/cordis` 保持 external。
 
 ## License
 

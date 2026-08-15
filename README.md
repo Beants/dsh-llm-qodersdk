@@ -1,5 +1,7 @@
 # dsh-llm-qodersdk
 
+> **中文** | [English](README.en.md)
+
 将 DeepSeek Harness 的 LLM 接缝（`ctx.llm`）路由到本机 **Qoder CLI** 的适配器插件（`@deepseek-ai/dsh-llm-qoder`），基于 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk)。
 
 它注册 `qoder` / `qoder-byok` 两个 provider 路由，让 harness 的模型请求复用本机 `qodercli` 的登录态——**无需任何凭据或设置项**。模型与账号自定义模型都从 qodercli 实时拉取。

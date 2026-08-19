@@ -65,7 +65,7 @@ const EFFORT_NAMES: Readonly<Record<string, string>> = {
  * @param isReasoning - whether the model supports reasoning per the CLI.
  * @returns the harness reasoning metadata, or undefined to omit it.
  */
-function reasoningInfo(
+export function reasoningInfo(
   efforts: readonly string[] | undefined,
   defaultEffort: string | undefined,
   isReasoning: boolean | undefined,
@@ -242,7 +242,7 @@ interface ContinuationPlan {
  * turn). Tail tool-result messages were already resolved into parked handlers
  * and never feed; fresh user turns and mutated messages do.
  */
-function planContinuation(previous: readonly import('@deepseek-ai/dsh-llm').Message[], current: readonly import('@deepseek-ai/dsh-llm').Message[]): ContinuationPlan {
+export function planContinuation(previous: readonly import('@deepseek-ai/dsh-llm').Message[], current: readonly import('@deepseek-ai/dsh-llm').Message[]): ContinuationPlan {
   if (current.length <= previous.length) return { feed: null, rebuild: true }
   const mutated: number[] = []
   for (let i = 0; i < previous.length; i++) {

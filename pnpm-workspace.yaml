@@ -1,2 +1,2 @@
 allowBuilds:
-  '@qoder-ai/qoder-agent-sdk': set this to true or false
+  '@qoder-ai/qoder-agent-sdk': true

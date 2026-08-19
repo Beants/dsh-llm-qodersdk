@@ -6,7 +6,7 @@
  * and its custom models (`qoder-byok`), every model is addressable by its SDK
  * value (plus the two `deepseek-v4-*` aliases), and warm inner sessions close
  * with the plugin.
- * @module @deepseek-ai/dsh-llm-qoder
+ * @module @jiamingzang/dsh-llm-qoder
  */
 
 import type { Context } from '@deepseek-ai/cordis'

@@ -148,12 +148,12 @@ interface SdkMessage {
  * The host tool runtime dispatches by the bare host name; the inner model
  * only ever sees the namespaced MCP form, so strip the prefix on the way out.
  */
-function hostToolName(name: string): string {
+export function hostToolName(name: string): string {
   return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name
 }
 
 /** Deny native tools, allow this adapter's MCP tools. */
-async function gateTools(toolName: string, _input: unknown, options: { toolUseID?: string }): Promise<unknown> {
+export async function gateTools(toolName: string, _input: unknown, options: { toolUseID?: string }): Promise<unknown> {
   const echo = options.toolUseID !== undefined ? { toolUseID: options.toolUseID } : {}
   if (toolName.startsWith(MCP_TOOL_PREFIX)) return { behavior: 'allow', ...echo }
   return {
@@ -677,7 +677,7 @@ export class QoderSession {
 }
 
 /** Render tool-result content blocks into the single text the inner model reads. */
-function renderResultText(blocks: readonly ContentBlock[]): string {
+export function renderResultText(blocks: readonly ContentBlock[]): string {
   const parts: string[] = []
   for (const block of blocks) {
     if (block.type === 'text') parts.push(block.text)
@@ -687,7 +687,8 @@ function renderResultText(blocks: readonly ContentBlock[]): string {
   return parts.join('\n')
 }
 
-function safeErrors(errors: unknown): string {
+/** Safely stringify the SDK error payload for turn diagnostics. */
+export function safeErrors(errors: unknown): string {
   if (errors === undefined) return ''
   if (typeof errors === 'string') return errors
   try { return JSON.stringify(errors) } catch { return String(errors) }
@@ -700,7 +701,7 @@ function safeErrors(errors: unknown): string {
  * dsh-llm classifiers; only then does the harness overflow recovery (or quota
  * surfacing) fire instead of a dead-end BACKEND_TURN_ERROR.
  */
-function classifyTurnError(detail: string): string {
+export function classifyTurnError(detail: string): string {
   if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
   return 'BACKEND_TURN_ERROR'

@@ -2,20 +2,20 @@
 
 > **中文** | [English](README.en.md)
 
-将 DeepSeek Harness 的 LLM 接缝（`ctx.llm`）路由到本机 **Qoder CLI** 的适配器插件（`@deepseek-ai/dsh-llm-qoder`），基于 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk)。
+将 DeepSeek Harness 的 LLM 接缝（`ctx.llm`）路由到本机 **Qoder CLI** 的适配器插件（`@jiamingzang/dsh-llm-qoder`），基于 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk)。
 
 它注册 `qoder` / `qoder-byok` 两个 provider 路由，让 harness 的模型请求复用本机 `qodercli` 的登录态——**无需任何凭据或设置项**。模型与账号自定义模型都从 qodercli 实时拉取。
 
 ## 特性
 
 - **无配置接入**：完全复用本机 `qodercli` 登录态，不需要 API key 或 settings 段。
-- **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部。
-- **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对。
-- **模型目录**：实时从 CLI 拉取可用模型，TTL 缓存 + 并发共享，失败回退静态目录；另提供 `deepseek-v4-flash` / `deepseek-v4-pro` 别名。
-- **双 provider 分组**：`qoder` 出 qodercli 内置模型，`qoder-byok` 出账号自定义模型（`source === 'user'`），各自独立路由。
-- **思考强度**：`resolveModel` 上报 CLI 的 reasoning efforts 与默认档位，产品模型选择器自动显示思考强度选项；所选档位通过 model-policy 参数随每次请求下发。
-- **上下文窗口**：上报 CLI 的 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换上下文窗口（如 200K/400K/1M），并通过 model-policy 参数下发。
+- **双路由**：`qoder` 广告账号内置模型；`qoder-byok` 只广告账号自定义模型（各自独立路由）。
+- **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部；`maxSessions` 上限内按插入序 LRU 淘汰。
+- **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对（120s 内未回传则超时取消）。
+- **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享 + 超时保护，失败回退静态目录；另提供 `deepseek-v4-flash` → `dfmodel`、`deepseek-v4-pro` → `dmodel` 别名。
+- **思考强度与上下文窗口**：`resolveModel` 上报 CLI 的 reasoning efforts、默认档位与 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换；所选值随每次请求下发。
 - **旁路请求**：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。
+- **溢出可恢复**：内层模型因上下文超限失败时（如 `maximum context length ... you requested N tokens`），按 dsh-llm 的 `isContextWindowExceededError` 分类为 `CONTEXT_WINDOW_EXCEEDED` 上报，harness 的溢出自动恢复（配合 `compaction-basic`）可以接管而不是让轮次直接报废。
 
 ## 适配原理
 
@@ -120,15 +120,44 @@ function classifyTurnError(detail: string): string {
 
 ## 安装
 
-在 DeepSeek Harness（dsh）中作为插件加载：
+前置条件：本机已安装并登录 qodercli（`qodercli --version` 可运行）。插件完全复用 qodercli 登录态，不需要 API key 或 settings 段。
+
+### 从发布包引入（推荐）
+
+1. 获取发布包：在仓库根目录 `pnpm pack` 生成 `jiamingzang-dsh-llm-qoder-<version>.tgz`（发布版可直接使用）；
+2. 引入目标 profile：
+
+   ```sh
+   dsh plugin --profile <profile> add jiamingzang-dsh-llm-qoder-<version>.tgz
+   ```
+
+3. **首次安装需批准构建脚本**：`@qoder-ai/qoder-agent-sdk` 带 postinstall（下载 worker runtime），pnpm 11+ 默认拦截并报 `ERR_PNPM_IGNORED_BUILDS`。dsh 会把待批准 key 写入 profile 的 `pnpm-workspace.yaml` 占位（`allowBuilds` 下 `'@qoder-ai/qoder-agent-sdk': set this to true or false`），把值改为 `true` 后重跑上面的 add 命令即完成安装——这是 dsh 对任何带 postinstall 依赖的标准 fail-loud 流程；
+4. 验证：`dsh --profile <profile> --dump-config | grep llm-qoder` 应出现插件条目；重启服务后模型选择器出现 `qoder` / `qoder-byok`。
+
+### 手动挂载（bundle 声明）
+
+插件 package.json 声明 `dsh.bundle`（`cordis.patch.yml` 自动层叠进 profile 的 bundles）。也可在 cordis.yml 或 patch 层直接声明：
 
 ```yaml
-# cordis.yml 或 patch 层
 - id: llm-qoder
-  name: '@deepseek-ai/dsh-llm-qoder'
+  name: '@jiamingzang/dsh-llm-qoder'
 ```
 
-然后选择 `qoder` 或 `qoder-byok` provider 下的模型即可（在对话框模型选择器或 Models 设置页中）。
+### 干净环境试装
+
+用 `DSH_HOME` 隔离 profile 空间做引入测试，不影响现有环境：
+
+```sh
+export DSH_HOME=/path/to/clean-home
+dsh --profile web --dump-config   # 首次运行自动 bootstrap 默认 profile
+dsh plugin --profile web add jiamingzang-dsh-llm-qoder-<version>.tgz
+dsh --profile web --port 3090     # 用独立端口避开生产服务
+```
+
+### 使用与排障
+
+- 在对话框模型选择器或 Models 设置页选择 `qoder`（账号内置）或 `qoder-byok`（账号自定义）下的模型；上下文窗口与思考档位可在模型面板切换。
+- **看不到自定义模型或窗口调节消失**：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 `isEnabled: false`）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。
 
 ## 配置
 
@@ -136,6 +165,26 @@ function classifyTurnError(detail: string): string {
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | 同时保持 warm 的内层 qodercli 会话上限（超出按插入序 LRU 淘汰） |
 | `modelCacheTtlSeconds` | number | `300` | CLI 模型目录的缓存保鲜秒数 |
+
+## 上下文管理与压缩
+
+warm 内层会话会累积整段宿主历史：首轮喂入全量历史（`renderInitialFeed`），之后每轮只喂增量（新用户消息、原位刷新）。内层上下文因此随对话增长，模型有硬上限（如 1048576 tokens）。
+
+- **溢出自动恢复**：内层模型报上下文超限时，插件上报 `CONTEXT_WINDOW_EXCEEDED`。harness 的溢出恢复（`dsh-compaction-basic` 的 `agent/request-error` 处理器）会压缩宿主历史并重试；压缩后宿主历史变短，下个请求插件检测到历史回退，自动重建内层会话、冷喂压缩后的历史。
+- **前提**：部署里必须加载 `dsh-compaction-basic`（`auto` 默认 `true`）和 `dsh-token-meter`。没装压缩插件时，超限轮次仍会失败——只能新开会话或手动压缩。
+- **建议把压力阈值调低**：默认 `thresholdRatio` 0.8 × 模型 contextWindow（1048576 → 约 838k）可能偏晚，尤其宿主侧 token 估算与内层真实用量有偏差时。建议调低到 0.6，让压力压缩远早于溢出触发：
+
+  ```yaml
+  - id: compaction-basic
+    config:
+      auto: true
+      thresholdRatio: 0.6
+      retainRatio: 0.16
+  ```
+
+  也可用 `modelPolicies` 给 `qoder` 路由单独配置。
+- **手动压缩**：加载 `dsh-command-compact` 后，对话中输入 `/compact` 立即压缩一次。
+- **已超限的会话**：历史已经超过模型上限时，"继续"只会带着更长历史重试失败；先 `/compact` 压缩（或调低阈值后等压力压缩触发），否则新开会话。
 
 ## 源码结构
 
@@ -151,17 +200,19 @@ function classifyTurnError(detail: string): string {
 
 ## 开发与构建
 
-本仓库只存源码（`src/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，由构建脚本按需生成。
+本仓库只存源码（`src/`）与测试（`tests/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，由构建脚本按需生成。
 
 ```sh
-npm install
-npm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
-npm publish     # prepublishOnly 自动先构建
+pnpm install
+pnpm test        # vitest 单元测试
+pnpm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
+pnpm pack        # 生成 jiamingzang-dsh-llm-qoder-<version>.tgz
+pnpm publish     # prepublishOnly 自动先构建
 ```
 
 构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
 
-> **当前限制**：`@deepseek-ai/dsh-llm@^0.1.0-rc.5` 尚未发布到公共 npm（registry 上仅有 `0.0.1-rc.1`），因此 `npm install` 暂时无法解析该 peer 依赖，独立构建也暂不可运行。等它发布后，本仓库即可直接 `npm install && npm run build && npm publish`。在此之前，实际构建/使用仍在 DeepSeek Harness 仓库内的 `plugins/llm-qoder/` 完成（由仓库根配置 `tsc` + `tsdown` 产出 `lib/`）。
+> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm@^0.1.0-rc.5` 已可从公共 npm 解析（当前最新为 `0.1.0-rc.6`），本仓库可直接 `pnpm install && pnpm run build`。若需与 DeepSeek Harness 主仓库内的本地版本（`0.1.0-rc.5`）完全对齐，可在主仓库 `plugins/llm-qoder/` 目录内构建（由仓库根 `tsc` + `tsdown` 产出 `lib/`）。
 
 ## License
 

@@ -122,9 +122,9 @@ Provider context overflow thus triggers harness auto-recovery and quota exhausti
 
 Prerequisites: a local `qodercli` binary with an active login (`qodercli --version` runs). The plugin fully reuses the qodercli login state — no API key or settings section needed.
 
-### From the release tarball (recommended)
+### From the release tarball
 
-1. Produce the tarball: `pnpm pack` in the repo root emits `jiamingzang-dsh-llm-qoder-<version>.tgz` (or use the published artifact);
+1. Get the package: download the latest `jiamingzang-dsh-llm-qoder-<version>.tgz` from this repository's Releases (or produce it yourself with `pnpm pack` in the repo root);
 2. Add it to the target profile:
 
    ```sh
@@ -134,24 +134,13 @@ Prerequisites: a local `qodercli` binary with an active login (`qodercli --versi
 3. **First install requires approving a build script**: `@qoder-ai/qoder-agent-sdk` ships a postinstall (downloads the worker runtime), which pnpm 11+ blocks by default with `ERR_PNPM_IGNORED_BUILDS`. dsh writes the pending key into the profile's `pnpm-workspace.yaml` placeholder (`'@qoder-ai/qoder-agent-sdk': set this to true or false` under `allowBuilds`); set it to `true` and rerun the add command to finish — this is dsh's standard fail-loud flow for any dependency with postinstall scripts;
 4. Verify: `dsh --profile <profile> --dump-config | grep llm-qoder` shows the plugin entry; after restarting the service, the model selector offers `qoder` / `qoder-byok`.
 
-### Manual mount (bundle declaration)
+### Manual mount (optional)
 
-The plugin's package.json declares `dsh.bundle` (`cordis.patch.yml` layers into the profile's bundles automatically). You can also declare it directly in cordis.yml or a patch layer:
+Without the plugin command, declare it directly in cordis.yml or a patch layer (the plugin's package.json also declares `dsh.bundle`, so plugin add joins it to the profile's bundles automatically):
 
 ```yaml
 - id: llm-qoder
   name: '@jiamingzang/dsh-llm-qoder'
-```
-
-### Trial install in a clean environment
-
-Isolate a profile space with `DSH_HOME` to test the introduction without touching existing environments:
-
-```sh
-export DSH_HOME=/path/to/clean-home
-dsh --profile web --dump-config   # first run bootstraps a default profile
-dsh plugin --profile web add jiamingzang-dsh-llm-qoder-<version>.tgz
-dsh --profile web --port 3090     # separate port, away from production
 ```
 
 ### Usage & troubleshooting

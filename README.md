@@ -122,10 +122,10 @@ function classifyTurnError(detail: string): string {
 
 前置条件：本机已安装并登录 qodercli（`qodercli --version` 可运行）。插件完全复用 qodercli 登录态，不需要 API key 或 settings 段。
 
-### 从发布包引入（推荐）
+### 从发布包引入
 
-1. 获取发布包：在仓库根目录 `pnpm pack` 生成 `jiamingzang-dsh-llm-qoder-<version>.tgz`（发布版可直接使用）；
-2. 引入目标 profile：
+1. 获取插件包：从本仓库 Releases 下载最新的 `jiamingzang-dsh-llm-qoder-<version>.tgz`（或在仓库根目录 `pnpm pack` 自行生成）；
+2. 添加到目标 profile：
 
    ```sh
    dsh plugin --profile <profile> add jiamingzang-dsh-llm-qoder-<version>.tgz
@@ -134,24 +134,13 @@ function classifyTurnError(detail: string): string {
 3. **首次安装需批准构建脚本**：`@qoder-ai/qoder-agent-sdk` 带 postinstall（下载 worker runtime），pnpm 11+ 默认拦截并报 `ERR_PNPM_IGNORED_BUILDS`。dsh 会把待批准 key 写入 profile 的 `pnpm-workspace.yaml` 占位（`allowBuilds` 下 `'@qoder-ai/qoder-agent-sdk': set this to true or false`），把值改为 `true` 后重跑上面的 add 命令即完成安装——这是 dsh 对任何带 postinstall 依赖的标准 fail-loud 流程；
 4. 验证：`dsh --profile <profile> --dump-config | grep llm-qoder` 应出现插件条目；重启服务后模型选择器出现 `qoder` / `qoder-byok`。
 
-### 手动挂载（bundle 声明）
+### 手动挂载（可选）
 
-插件 package.json 声明 `dsh.bundle`（`cordis.patch.yml` 自动层叠进 profile 的 bundles）。也可在 cordis.yml 或 patch 层直接声明：
+不经过 plugin 命令时，可在 cordis.yml 或 patch 层直接声明（插件 package.json 也声明了 `dsh.bundle`，plugin add 后会自动进 profile 的 bundles）：
 
 ```yaml
 - id: llm-qoder
   name: '@jiamingzang/dsh-llm-qoder'
-```
-
-### 干净环境试装
-
-用 `DSH_HOME` 隔离 profile 空间做引入测试，不影响现有环境：
-
-```sh
-export DSH_HOME=/path/to/clean-home
-dsh --profile web --dump-config   # 首次运行自动 bootstrap 默认 profile
-dsh plugin --profile web add jiamingzang-dsh-llm-qoder-<version>.tgz
-dsh --profile web --port 3090     # 用独立端口避开生产服务
 ```
 
 ### 使用与排障

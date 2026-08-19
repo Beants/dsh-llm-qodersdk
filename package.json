@@ -1,7 +1,7 @@
 {
   "name": "@jiamingzang/dsh-llm-qoder",
   "description": "Qoder CLI (qoder-agent-sdk) adapter for the DeepSeek Harness LLM seam",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

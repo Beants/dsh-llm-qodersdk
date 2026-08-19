@@ -397,6 +397,27 @@ describe('QoderSession.stream synthesis', () => {
     const usage = chunks.find(chunk => chunk.type === 'usage')
     expect(usage).toMatchObject({ usage: { inputTokens: expected, outputTokens: 1 } })
   })
+
+  it('passes the host session cwd to qodercli when set before spawn', async () => {
+    const { session, q } = makeSession()
+    session.setCwd('/home/zzzjm/新建文件夹')
+    const stream = startStream(session)
+    const pending = stream.all()
+    q.push(textDelta('hi'))
+    q.push(resultFrame('success'))
+    await pending
+    expect(q.options.cwd).toBe('/home/zzzjm/新建文件夹')
+  })
+
+  it('omits cwd from the qodercli options when the host session has none', async () => {
+    const { session, q } = makeSession()
+    const stream = startStream(session)
+    const pending = stream.all()
+    q.push(textDelta('hi'))
+    q.push(resultFrame('success'))
+    await pending
+    expect(q.options.cwd).toBeUndefined()
+  })
 })
 
 describe('QoderSession tool pairing', () => {

@@ -18,7 +18,7 @@ import type {
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
-import { renderIdentityAppend, renderInitialFeed } from './render.ts'
+import { renderInitialFeed } from './render.ts'
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -209,6 +209,8 @@ export class QoderSession {
   turnInputChars = 0
   /** Host system prompt captured before spawn for the boot-time systemPrompt. */
   private hostSystem: string | undefined
+  /** Host session workspace; qodercli runs there so its preset reports the session cwd. */
+  private sessionCwd: string | undefined
 
   // Active-turn assembly state, touched only by the consumer fiber.
   private blockIndex = 0
@@ -258,7 +260,10 @@ export class QoderSession {
         }),
         mcpServers: { [MCP_SERVER_NAME]: this.mcp },
         allowedMcpServerNames: [MCP_SERVER_NAME],
-        systemPrompt: { type: 'preset', preset: 'qodercli', append: renderIdentityAppend(this.hostSystem) },
+        // Host prompt passes through verbatim: no qodercli preset, so its
+        // injected workspace/environment fields never reach the model.
+        ...this.hostSystem === undefined ? {} : { systemPrompt: this.hostSystem },
+        ...this.sessionCwd === undefined ? {} : { cwd: this.sessionCwd },
       },
     })
     this.q = q
@@ -278,6 +283,14 @@ export class QoderSession {
 
   /** Record the host system prompt; effective only before the process spawns. */
   setSystem(system: string | undefined): void { this.hostSystem = system }
+
+  /**
+   * Record the host session workspace; effective only before the process
+   * spawns. qodercli inherits the host process cwd otherwise, which would
+   * make its preset report the server's launch directory instead of the
+   * session's workspace.
+   */
+  setCwd(cwd: string | undefined): void { this.sessionCwd = cwd }
 
   /**
    * Permission gate for the inner process. Native tools are denied; MCP host

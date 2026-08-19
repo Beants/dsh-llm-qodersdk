@@ -215,6 +215,10 @@ export class QoderAdapter extends LlmAdapter {
   ): AsyncGenerator<StreamChunk> {
     session.setModel(model, policy)
     session.setSystem(options.system)
+    // Older dsh-llm releases lack the cwd field on GenerateOptions; read it
+    // through the widened view so this adapter compiles against the peer range.
+    const cwd = (options as GenerateOptions & { cwd?: string }).cwd
+    session.setCwd(cwd)
     session.ensureTools(options.tools ?? [])
     session.recordRequestInput(options.system, options.messages)
     session.fedMessages = options.messages

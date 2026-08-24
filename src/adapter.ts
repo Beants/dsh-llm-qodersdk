@@ -184,7 +184,6 @@ export class QoderAdapter extends LlmAdapter {
     const sessionId = String(options.sessionId)
     const policy = {
       ...options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort },
-      ...options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow },
     }
     let session = this.sessions.forSession(sessionId, model)
     if (session.fedMessages === undefined) {

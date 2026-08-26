@@ -14,6 +14,7 @@
 - **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对（120s 内未回传则超时取消）。
 - **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享 + 超时保护，失败回退静态目录；另提供 `deepseek-v4-flash` → `dfmodel`、`deepseek-v4-pro` → `dmodel` 别名。
 - **思考强度与上下文窗口**：`resolveModel` 上报 CLI 的 reasoning efforts、默认档位与 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换；所选值随每次请求下发。
+- **视觉输入（多模态）**：透传 live 目录的 `isVl` 能力声明，视觉模型（如 Kimi-K3）广告 `['text','image']`；用户图片与工具结果图片经 `ctx.attachments` 按预算压缩后以 base64 转发。附件缺失或读取失败时降级为占位文本，回合永不因此失败；纯文本会话的线上协议与旧版字节级一致。
 - **旁路请求**：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。
 - **溢出可恢复**：内层模型因上下文超限失败时（如 `maximum context length ... you requested N tokens`），按 dsh-llm 的 `isContextWindowExceededError` 分类为 `CONTEXT_WINDOW_EXCEEDED` 上报，harness 的溢出自动恢复（配合 `compaction-basic`）可以接管而不是让轮次直接报废。
 
@@ -40,7 +41,7 @@ harness 通过 `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` 注�
 ### 2. 会话模型适配
 
 - **一宿主会话对应一 warm qodercli 会话**：`QoderSessionManager` 以宿主 `sessionId` 为键维护 `query()` 子进程，超出 `maxSessions` 按插入序 LRU 淘汰。
-- **增量 feed**：宿主每次请求携带完整消息列表，插件通过 `planContinuation` 对比上一次，只把新用户轮次与改写消息渲染成纯文本 feed；工具结果不进入文本 feed（走 MCP）。
+- **增量 feed**：宿主每次请求携带完整消息列表，插件通过 `planContinuation` 对比上一次，只把新用户轮次与改写消息渲染成 feed——无图片时为纯文本（与旧协议字节级一致），有图片时为文本+图片 parts；工具结果不进入文本 feed（走 MCP）。
 - **重建检测**：当宿主 surface 被改写（例如 compaction 折叠了历史）导致消息数变少或结构变化，`planContinuation` 返回 `rebuild: true`，插件 dispose 旧 warm 会话并按新 surface 冷启动。**这保证了 dsh 侧的压缩与 qodercli 内部缓存不会产生双份状态**。
 - **模型切换**：`setModel` 把 `reasoningEffort` / `contextWindow` 作为 model-policy 参数传给内层会话。
 
@@ -51,7 +52,7 @@ harness 通过 `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` 注�
 1. `ensureTools()` 把宿主 `ToolSchema` 转成 zod shape 注册到 MCP server；
 2. qodercli 的 `canUseTool` 允许 `mcp__dsh-host__*` 前缀的工具，并记录 tool-use id；
 3. MCP handler **park** 在一个 promise 上，等待宿主在下一轮请求里 `deliverToolResults()` 回传结果；
-4. 结果按 `callId ↔ toolUseId` 配对投递；超时（`TOOL_RESULT_TIMEOUT_MS`）则返回错误让 qodercli 恢复。
+4. 结果按 `callId ↔ toolUseId` 配对投递；超时（`TOOL_RESULT_TIMEOUT_MS`）则返回错误让 qodercli 恢复。图片结果以 MCP `ImageContent` 回传（视觉模型收到真实字节，见第 5 节）。
 
 这样宿主工具调用是**宿主侧的普通工具轮次**，qodercli 只看到 MCP 工具被"执行了一次"。
 
@@ -61,7 +62,14 @@ harness 通过 `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` 注�
 - **静态回退**：`QODER_MODELS` 内置捕获的模型表（含 `deepseek-v4-flash` / `deepseek-v4-pro` 别名），CLI 不可达时使用。
 - **provider 分组**：`listModels` 按 `source` 字段分流——内置模型进 `qoder`，账号自定义模型（`source === 'user'`）进 `qoder-byok`，无需任何手动配置，全部从 qodercli 实时拉取。
 
-### 5. 上下文窗口与压缩阈值的适配
+### 5. 视觉（图片输入）适配
+
+- **能力以 live 目录为准**：`isVl` 只由实时目录携带；`resolveModel` 仅对已验证的视觉模型声明 `inputModalities: ['text','image']`。目录拉取失败或静态回退一律按纯文本声明——宁可少报能力，也不让 harness 视觉门放行后实际读不到图。
+- **字节转发**：渲染层（`render.ts`）把图片保留为 part；adapter 经 `ctx.attachments.readImageRequest`（懒取、非硬 inject；预算 640K 像素 / 1 MiB，镜像 dsh-llm-deepseek）解析成 SDK 的 `{type:'image', source:{type:'base64',...}}` 块。用户消息与工具结果（MCP `ImageContent`）两个方向都覆盖；同一附件在一次请求内只解析一次。
+- **优雅降级**：非视觉模型、无 attachment store、单图读取失败，都降级为占位文本（`[图片附件…]` / `[图片结果]`），逐图独立，回合永不因此失败。
+- **协议兼容**：无图片时 feed 仍是纯字符串，与旧版字节级一致；token 估算每图计 4800 字符。
+
+### 6. 上下文窗口与压缩阈值的适配
 
 qodercli 的 live catalog 对每个模型同时上报**上限**与**实际窗口**：
 
@@ -81,13 +89,13 @@ contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTE
 - `maxInputTokens`（上限，如 1M）只保留在 `availableContextWindows` 里供选择器切换；
 - 若误用上限，阈值会被放大（如 800K），压缩永远不会在 provider 拒绝前触发。
 
-### 6. 上下文占用计量的适配
+### 7. 上下文占用计量的适配
 
 qodercli 的流事件 `usage` 帧（`input_tokens` / `output_tokens`）默认全零（无 metering 数据），因此无法直接上报真实用量。harness 的 `contextPressure` 投影以最近一次请求的 `inputTokens` 为分子（`pressureTokens`）驱动 UI 环与压缩判断。
 
 适配方式：**在插件侧按 harness 前端 token-meter 相同的口径估算每次请求的输入**。
 
-`adapter.stream()` 每次请求调用 `session.recordRequestInput(system, messages)`，用 `renderInitialFeed(system, messages)` 渲染完整会话（系统提示 + 全部消息），按 `rendered.length / 4` 估算 token —— 与 harness `estimate.ts` 的 `CHARS_PER_TOKEN = 4` 同口径。`usage()` 优先返回该估算值：
+`adapter.stream()` 每次请求调用 `session.recordRequestInput(system, messages)`，用 `renderInitialFeed(system, messages)` 渲染完整会话（系统提示 + 全部消息），按 `rendered.length / 4` 估算 token —— 与 harness `estimate.ts` 的 `CHARS_PER_TOKEN = 4` 同口径；图片引用每张额外计 4800 字符。`usage()` 优先返回该估算值：
 
 ```ts
 if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
@@ -97,7 +105,7 @@ if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
 
 这样 UI 上下文环、自动压缩阈值与插件上报值**使用同一套估算口径**，占用显示与压缩行为一致，不会出现"UI 显示 2% 而实际已接近上限"的割裂。
 
-### 7. 错误分类适配
+### 8. 错误分类适配
 
 qodercli 把上下文超限、配额不足等拒绝统一报成 generic per-turn error（`error_during_execution`）。harness 的 overflow recovery 依赖错误码 `CONTEXT_WINDOW_EXCEEDED` 才会触发（prune + compact + retry）。因此插件用 dsh-llm 的共享分类器把 qodercli 的报错文本映射成 harness 可路由的错误码：
 
@@ -111,7 +119,7 @@ function classifyTurnError(detail: string): string {
 
 这样 provider 的上下文超限能触发 harness 的自动恢复，配额不足能正确展示，而不是当作普通后端错误死掉。
 
-### 8. 压缩职责分工（dsh vs qoder）
+### 9. 压缩职责分工（dsh vs qoder）
 
 - **压缩由 dsh（harness compaction-basic）执行**：决定压缩范围、保留比例（默认 `retainRatio: 0.16` 保留最近 16%）、调用 LLM 生成 checkpoint、改写会话 surface。
 - **qoder 插件只充当 LLM 后端**：把 dsh 的消息喂给 qodercli、取回回复。压缩摘要请求通过 side-channel 走 `coldStream()`，并复用主会话模型（见第 1 节），保证 dsh 记录的摘要目标与实际执行一致。
@@ -147,6 +155,7 @@ function classifyTurnError(detail: string): string {
 
 - 在对话框模型选择器或 Models 设置页选择 `qoder`（账号内置）或 `qoder-byok`（账号自定义）下的模型；上下文窗口与思考档位可在模型面板切换。
 - **看不到自定义模型或窗口调节消失**：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 `isEnabled: false`）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。
+- **图片发不出去 / 报 `does not declare image input`**：视觉能力由 live 目录的 `isVl` 决定（如 Kimi-K3 支持、`lite` 不支持）；升级插件后需重启 dsh 才生效（插件加载 `lib/index.js`，无 HMR）。目录拉取失败时按纯文本处理，CLI 恢复后自动获得视觉能力。
 
 ## 配置
 
@@ -154,6 +163,7 @@ function classifyTurnError(detail: string): string {
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | 同时保持 warm 的内层 qodercli 会话上限（超出按插入序 LRU 淘汰） |
 | `modelCacheTtlSeconds` | number | `300` | CLI 模型目录的缓存保鲜秒数 |
+| `contextWindow` | number | 无 | 覆盖有效上下文窗口：同时上报给宿主（压缩阈值 + 上下文环）并下发每个会话的 model policy；按模型上限（`maxInputTokens` / `availableContextWindows` 最大值）截断。缺省用 CLI 默认值 |
 
 ## 上下文管理与压缩
 
@@ -179,13 +189,14 @@ warm 内层会话会累积整段宿主历史：首轮喂入全量历史（`rende
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口：`ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` |
-| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成，warm 会话管理、续轮规划、side-channel 模型传递、请求输入估算 |
-| `src/session.ts` | `QoderSession`：内层 `query()` 子进程、MCP 工具桥、SDK 流事件 → harness `StreamChunk`、usage 上报（真实输入估算 + 错误分类） |
-| `src/models.ts` | 实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退） |
-| `src/catalog.ts` | 静态模型表与 `deepseek-v4-*` 别名 |
-| `src/render.ts` | 宿主消息 → 内层纯文本 feed；身份覆盖 |
+| `src/index.ts` | 插件入口：`ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)`；懒取 `ctx.attachments` 注入 adapter |
+| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成，warm 会话管理、续轮规划、side-channel 模型传递、请求输入估算、视觉能力判定与图片解析 |
+| `src/session.ts` | `QoderSession`：内层 `query()` 子进程、MCP 工具桥（结果含 MCP `ImageContent`）、SDK 流事件 → harness `StreamChunk`、usage 上报（真实输入估算 + 错误分类） |
+| `src/models.ts` | 实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退、`isVl` 透传） |
+| `src/catalog.ts` | 静态模型表与 `deepseek-v4-*` 别名（无 `isVl`，纯文本兜底） |
+| `src/render.ts` | 宿主消息 → 内层 feed（纯文本或 文本+图片 parts）；身份覆盖 |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape（MCP 工具注册用） |
+| `scripts/check-isvl.mjs` | 活目录 `isVl` 探针（诊断视觉能力用） |
 
 ## 开发与构建
 
@@ -201,7 +212,7 @@ pnpm publish     # prepublishOnly 自动先构建
 
 构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
 
-> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm@^0.1.0-rc.5` 已可从公共 npm 解析（当前最新为 `0.1.0-rc.6`），本仓库可直接 `pnpm install && pnpm run build`。若需与 DeepSeek Harness 主仓库内的本地版本（`0.1.0-rc.5`）完全对齐，可在主仓库 `plugins/llm-qoder/` 目录内构建（由仓库根 `tsc` + `tsdown` 产出 `lib/`）。
+> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` 精确钉在 `0.1.1-rc.2`——dsh 0.1.1-rc.x 运行时的 `LlmAdapter` 基类新增了 `prepareCall` 具体方法（所有调用经它派发），而 npm 上 `0.1.1-rc.x` 同名版本的 tarball 内容互不一致；钉死 rc.2 保证插件加载的基类与运行时内置副本逐字节一致。本仓库可直接 `pnpm install && pnpm test && pnpm run build`。
 
 ## License
 

@@ -14,6 +14,7 @@ It registers the `qoder` / `qoder-byok` provider routes so the harness's model r
 - **Tool bridging**: host tools are exposed to the inner model through an in-process MCP server (`dsh-host`); qodercli executes one call at a time and the host returns the whole round of results, paired by callId (timed out and cancelled if not delivered within 120s).
 - **Model catalog**: fetches available models (including account-custom ones) live from the CLI with TTL caching + shared concurrency + timeout protection, falling back to a static catalog on failure; also provides `deepseek-v4-flash` → `dfmodel` and `deepseek-v4-pro` → `dmodel` aliases.
 - **Reasoning effort & context window**: `resolveModel` reports the CLI's reasoning efforts, default level, and `availableContextWindows` / `defaultContextWindow` so the model selector can switch them; the selected values are sent per-request via the model-policy parameter.
+- **Vision input (multimodal)**: passes through the live catalog's `isVl` capability, so vision models (e.g. Kimi-K3) advertise `['text','image']`; user images and tool-result images are read via `ctx.attachments` under pixel/byte budgets and forwarded as base64. Missing or unreadable attachments degrade to placeholder text and never fail the turn; text-only conversations stay byte-identical to the legacy wire protocol.
 - **Side-channel requests**: titles, compaction summaries, and other side-channel requests use one-shot cold calls that never occupy a warm session.
 - **Overflow recoverable**: when the inner model fails on context overflow (e.g. `maximum context length ... you requested N tokens`), the error is classified as `CONTEXT_WINDOW_EXCEEDED` via dsh-llm's `isContextWindowExceededError`, so the harness's overflow auto-recovery (with `compaction-basic`) takes over instead of wasting the turn.
 
@@ -40,7 +41,7 @@ The core of the adaptation is **`stream()` routing**:
 ### 2. Session model adaptation
 
 - **One host session ↔ one warm qodercli session**: `QoderSessionManager` keys `query()` subprocesses by host `sessionId`; beyond `maxSessions` they are evicted LRU by insertion order.
-- **Incremental feed**: the host sends the full message list on every request; the plugin uses `planContinuation` to diff against the previous one and renders only the new user turns and rewritten messages into a plain-text feed; tool results never enter the text feed (they go over MCP).
+- **Incremental feed**: the host sends the full message list on every request; the plugin uses `planContinuation` to diff against the previous one and renders only the new user turns and rewritten messages — a plain-text feed when no image is present (byte-identical to the legacy protocol), or text+image parts otherwise; tool results never enter the text feed (they go over MCP).
 - **Rebuild detection**: when the host surface is rewritten (e.g. compaction folds history) so messages shrink or restructure, `planContinuation` returns `rebuild: true` and the plugin disposes the old warm session and cold-starts from the new surface. **This guarantees dsh-side compaction and qodercli's internal cache never hold duplicate state.**
 - **Model switching**: `setModel` forwards `reasoningEffort` / `contextWindow` to the inner session as model-policy parameters.
 
@@ -51,7 +52,7 @@ Host tools are not sent directly to qodercli; they go through an **in-process MC
 1. `ensureTools()` converts host `ToolSchema` to zod shapes and registers them on the MCP server;
 2. qodercli's `canUseTool` allows tools with the `mcp__dsh-host__*` prefix and records tool-use ids;
 3. the MCP handler **parks** on a promise, waiting for the host to deliver results via `deliverToolResults()` in the next request round;
-4. results are paired by `callId ↔ toolUseId`; on timeout (`TOOL_RESULT_TIMEOUT_MS`) an error is returned so qodercli can recover.
+4. results are paired by `callId ↔ toolUseId`; on timeout (`TOOL_RESULT_TIMEOUT_MS`) an error is returned so qodercli can recover. Image results are delivered as MCP `ImageContent` (vision models receive the real bytes, see §5).
 
 Host tool calls thus remain ordinary tool rounds on the host side, while qodercli only sees an MCP tool "executed once".
 
@@ -61,7 +62,14 @@ Host tool calls thus remain ordinary tool rounds on the host side, while qodercl
 - **Static fallback**: `QODER_MODELS` is a captured built-in model table (including `deepseek-v4-flash` / `deepseek-v4-pro` aliases), used when the CLI is unreachable.
 - **Provider grouping**: `listModels` splits by the `source` field — built-in models go to `qoder`, account-custom models (`source === 'user'`) go to `qoder-byok`. No manual configuration; everything is fetched live from qodercli.
 
-### 5. Context window & compaction threshold adaptation
+### 5. Vision (image input) adaptation
+
+- **Capability comes from the live catalog only**: `isVl` rides the live catalog; `resolveModel` declares `inputModalities: ['text','image']` only for verified vision models. A failed catalog fetch or the static fallback always declares text-only — better to under-report than to pass the harness vision gate and then fail to read the image.
+- **Byte forwarding**: the render layer (`render.ts`) keeps images as parts; the adapter resolves them through `ctx.attachments.readImageRequest` (lazy lookup, not a hard inject; budgets of 640K pixels / 1 MiB mirror dsh-llm-deepseek) into the SDK's `{type:'image', source:{type:'base64',...}}` block. Both directions are covered — user messages and tool results (MCP `ImageContent`) — and one attachment resolves at most once per request.
+- **Graceful degradation**: a non-vision model, a missing attachment store, or one unreadable image all degrade to placeholder text (`[图片附件…]` / `[图片结果]`), independently per image — the turn never fails because of it.
+- **Protocol compatibility**: without images the feed stays a plain string, byte-identical to the legacy protocol; the token estimate charges 4800 characters per image.
+
+### 6. Context window & compaction threshold adaptation
 
 The qodercli live catalog reports both the **ceiling** and the **actual window** for each model:
 
@@ -81,13 +89,13 @@ contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTE
 - `maxInputTokens` (the ceiling, e.g. 1M) stays only in `availableContextWindows` for the selector to switch;
 - If the ceiling were used, the threshold would be inflated (e.g. 800K) and compaction would never fire before the provider rejects the request.
 
-### 6. Context usage metering adaptation
+### 7. Context usage metering adaptation
 
 The qodercli stream `usage` frames (`input_tokens` / `output_tokens`) are zeroed by default (no metering data), so real usage cannot be reported directly. The harness `contextPressure` projection uses the most recent request's `inputTokens` as the numerator (`pressureTokens`) to drive the UI ring and compaction checks.
 
 Adaptation: **estimate each request's input on the plugin side with the same measure the harness front-end token meter uses.**
 
-`adapter.stream()` calls `session.recordRequestInput(system, messages)` on every request, rendering the full conversation (system prompt + all messages) via `renderInitialFeed(system, messages)` and estimating tokens as `rendered.length / 4` — the same `CHARS_PER_TOKEN = 4` convention as harness `estimate.ts`. `usage()` prefers this estimate:
+`adapter.stream()` calls `session.recordRequestInput(system, messages)` on every request, rendering the full conversation (system prompt + all messages) via `renderInitialFeed(system, messages)` and estimating tokens as `rendered.length / 4` — the same `CHARS_PER_TOKEN = 4` convention as harness `estimate.ts`; each image reference additionally charges 4800 characters. `usage()` prefers this estimate:
 
 ```ts
 if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
@@ -97,7 +105,7 @@ if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
 
 The UI context ring, auto-compaction threshold, and the plugin-reported values thus **share one estimation convention**: occupancy display and compaction behavior agree, with no "UI shows 2% while actually near the limit" split.
 
-### 7. Error classification adaptation
+### 8. Error classification adaptation
 
 qodercli reports context overflow, quota exhaustion, and other rejections uniformly as a generic per-turn error (`error_during_execution`). The harness overflow recovery only triggers on the `CONTEXT_WINDOW_EXCEEDED` code (prune + compact + retry). The plugin therefore maps qodercli error text to harness-routable codes using dsh-llm's shared classifier:
 
@@ -111,7 +119,7 @@ function classifyTurnError(detail: string): string {
 
 Provider context overflow thus triggers harness auto-recovery and quota exhaustion surfaces correctly, instead of dying as an ordinary backend error.
 
-### 8. Compaction responsibility split (dsh vs qoder)
+### 9. Compaction responsibility split (dsh vs qoder)
 
 - **Compaction is executed by dsh** (harness compaction-basic): it decides the compaction scope and retention ratio (default `retainRatio: 0.16` keeps the most recent 16%), calls the LLM to produce a checkpoint, and rewrites the session surface.
 - **The qoder plugin only acts as the LLM backend**: it feeds dsh's messages to qodercli and returns the replies. Compaction summary requests go through the side-channel `coldStream()` and reuse the main session's model (see §1), so the summary target dsh records matches what actually runs.
@@ -147,6 +155,7 @@ Without the plugin command, declare it directly in cordis.yml or a patch layer (
 
 - Pick a model under `qoder` (account built-ins) or `qoder-byok` (account custom models) in the dialog model selector or the Models settings page; context window and reasoning effort are switchable in the model panel.
 - **Custom models or the context-window switch gone**: usually the live catalog fetch failed during a qodercli auto-upgrade window or because the account quota ran out (the backend marks models `isEnabled: false`), so the plugin fell back to the static catalog. Failed fetches are not cached; once the CLI recovers, the live catalog returns automatically — no service restart needed.
+- **Images rejected / `does not declare image input`**: vision capability comes from the live catalog's `isVl` (Kimi-K3 has it; `lite` does not); a dsh restart is required after upgrading the plugin (the plugin loads `lib/index.js`, no HMR). On catalog failure the model is treated as text-only and regains vision automatically once the CLI recovers.
 
 ## Configuration
 
@@ -154,6 +163,7 @@ Without the plugin command, declare it directly in cordis.yml or a patch layer (
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | Max warm inner qodercli sessions kept (beyond this, LRU eviction by insertion order) |
 | `modelCacheTtlSeconds` | number | `300` | Freshness TTL for the CLI model catalog cache |
+| `contextWindow` | number | none | Overrides the effective context window: reported to the host (compaction threshold + context ring) and pushed into every session's model policy; clamped by the model ceiling (`maxInputTokens` / largest `availableContextWindows` entry). Absent → the CLI default |
 
 ## Context Management & Compaction
 
@@ -179,13 +189,14 @@ Warm inner sessions accumulate the whole host history: the first turn feeds the 
 
 | File | Responsibility |
 | --- | --- |
-| `src/index.ts` | Plugin entry: `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` |
-| `src/adapter.ts` | `QoderAdapter`: model listing/resolution/streaming, warm session management, continuation planning, side-channel model pass-through, request input estimation |
-| `src/session.ts` | `QoderSession`: inner `query()` subprocess, MCP tool bridge, SDK stream events → harness `StreamChunk`, usage reporting (input estimation + error classification) |
-| `src/models.ts` | Live model catalog fetch (TTL cache, shared concurrency, timeout, static fallback) |
-| `src/catalog.ts` | Static model table and `deepseek-v4-*` aliases |
-| `src/render.ts` | Host messages → inner plain-text feed; identity override |
+| `src/index.ts` | Plugin entry: `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)`; lazily injects `ctx.attachments` into the adapter |
+| `src/adapter.ts` | `QoderAdapter`: model listing/resolution/streaming, warm session management, continuation planning, side-channel model pass-through, request input estimation, vision capability check and image resolution |
+| `src/session.ts` | `QoderSession`: inner `query()` subprocess, MCP tool bridge (results include MCP `ImageContent`), SDK stream events → harness `StreamChunk`, usage reporting (input estimation + error classification) |
+| `src/models.ts` | Live model catalog fetch (TTL cache, shared concurrency, timeout, static fallback, `isVl` pass-through) |
+| `src/catalog.ts` | Static model table and `deepseek-v4-*` aliases (no `isVl`; text-only fallback) |
+| `src/render.ts` | Host messages → inner feed (plain text or text+image parts); identity override |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape (for MCP tool registration) |
+| `scripts/check-isvl.mjs` | Live-catalog `isVl` probe (vision capability diagnostics) |
 
 ## Development & Build
 
@@ -201,7 +212,7 @@ pnpm publish     # prepublishOnly builds first
 
 The build config is in place (`tsconfig.json` + `tsdown.config.ts`); peer dependencies `@deepseek-ai/dsh-llm` and `@deepseek-ai/cordis` stay external.
 
-> **Version note**: the peer dependency `@deepseek-ai/dsh-llm@^0.1.0-rc.5` is now resolvable from the public npm registry (currently `0.1.0-rc.6`), so this repo can `pnpm install && pnpm run build` directly. To align exactly with the local version inside the DeepSeek Harness repo (`0.1.0-rc.5`), build inside `plugins/llm-qoder/` there instead (the repo-root `tsc` + `tsdown` produce `lib/`).
+> **Version note**: the peer dependencies `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` are pinned exactly to `0.1.1-rc.2` — the dsh 0.1.1-rc.x runtime's `LlmAdapter` base class gained a concrete `prepareCall` method (every call dispatches through it), and the same-named `0.1.1-rc.x` tarballs on npm differ from one another; pinning rc.2 guarantees the base class the plugin loads is byte-identical to the runtime's built-in copy. This repo builds directly with `pnpm install && pnpm test && pnpm run build`.
 
 ## License
 

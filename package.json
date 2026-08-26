@@ -30,7 +30,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/JiamingZang/dsh-llm-qodersdk.git"
+    "url": "https://github.com/Beants/dsh-llm-qodersdk.git"
   },
   "dsh": {
     "bundle": {

@@ -5,12 +5,20 @@ import { describe, expect, it } from 'vitest'
 import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import {
-  renderBlocks, renderIdentityAppend, renderInitialFeed, renderMessage, renderRefreshed,
-  renderSystemUpdate, renderUserTurn,
+  assembleFeed, blockParts, contentHasImage, imageRefCount, imageRefs, renderBlocks, renderIdentityAppend,
+  renderInitialFeed, renderInitialFeedParts, renderMessage, renderRefreshed, renderRefreshedParts,
+  renderSystemUpdate, renderUserTurn, renderUserTurnParts,
 } from '../src/render.ts'
 
 function text(content: string): ContentBlock {
   return { type: 'text', text: content }
+}
+
+function image(id: string): ContentBlock {
+  return {
+    type: 'image',
+    attachment: { attachmentId: id, mediaType: 'image/png', bytes: 3, width: 2, height: 2 },
+  } as ContentBlock
 }
 
 function userMessage(content: ContentBlock[], extra: Partial<Message> = {}): Message {
@@ -106,5 +114,68 @@ describe('renderIdentityAppend', () => {
   it('embeds the host system when present', () => {
     const append = renderIdentityAppend('你是宿主')
     expect(append).toContain('---- 宿主系统提示（作为你的行为准则与对外身份） ----\n你是宿主')
+  })
+})
+
+describe('vision part rendering', () => {
+  it('detects images, nested in tool results', () => {
+    expect(contentHasImage([text('a')])).toBe(false)
+    expect(contentHasImage([image('i1')])).toBe(true)
+    expect(contentHasImage([{ type: 'tool-result', toolCallId: CallId('c1'), content: [image('i1')] }])).toBe(true)
+    expect(imageRefCount([text('a'), image('i1'), image('i2')])).toBe(2)
+    expect(imageRefs([{ type: 'tool-result', toolCallId: CallId('c1'), content: [image('i2'), text('t')] }, image('i1')])
+      .map(ref => String(ref.attachmentId))).toEqual(['i2', 'i1'])
+  })
+
+  it('keeps image references as parts in block order', () => {
+    expect(blockParts([text('look'), image('i1'), text('here')])).toEqual([
+      { type: 'text', text: 'look' },
+      { type: 'image', attachment: { attachmentId: 'i1', mediaType: 'image/png', bytes: 3, width: 2, height: 2 } },
+      { type: 'text', text: 'here' },
+    ])
+  })
+
+  it('labels a user turn around the image', () => {
+    expect(renderUserTurnParts([text('look'), image('i1')])).toEqual([
+      { type: 'text', text: '[用户] look' },
+      { type: 'image', attachment: { attachmentId: 'i1', mediaType: 'image/png', bytes: 3, width: 2, height: 2 } },
+    ])
+  })
+
+  it('assembles all-text sections back into the identical string', () => {
+    expect(assembleFeed(['a', 'b'])).toBe('a\n\nb')
+    expect(assembleFeed(['a', [], 'b'])).toBe('a\n\nb')
+  })
+
+  it('assembles image sections as interleaved parts', () => {
+    expect(assembleFeed([
+      'role',
+      [{ type: 'text', text: '[用户] look' }, { type: 'image', attachment: { attachmentId: 'i1', mediaType: 'image/png', bytes: 3, width: 2, height: 2 } }],
+      'closing',
+    ])).toEqual([
+      { type: 'text', text: 'role\n\n[用户] look' },
+      { type: 'image', attachment: { attachmentId: 'i1', mediaType: 'image/png', bytes: 3, width: 2, height: 2 } },
+      { type: 'text', text: 'closing' },
+    ])
+  })
+
+  it('renders the initial feed as a plain string without images', () => {
+    expect(renderInitialFeedParts('sys', [userMessage([text('hi')])]))
+      .toBe(renderInitialFeed('sys', [userMessage([text('hi')])]))
+  })
+
+  it('keeps history images as parts in the initial feed', () => {
+    const feed = renderInitialFeedParts(undefined, [userMessage([text('look'), image('i1')])])
+    expect(Array.isArray(feed)).toBe(true)
+    const parts = feed as ReturnType<typeof blockParts>
+    expect(parts.some(part => part.type === 'image')).toBe(true)
+    expect(JSON.stringify(parts)).toContain('---- 宿主对话记录 ----')
+    expect(JSON.stringify(parts)).toContain('look')
+  })
+
+  it('marks a refreshed message with images as parts', () => {
+    const feed = renderRefreshedParts(userMessage([image('i1')]))
+    expect(Array.isArray(feed)).toBe(true)
+    expect((feed as ReturnType<typeof blockParts>).at(-1)).toEqual({ type: 'text', text: '（宿主原位刷新了这条消息）' })
   })
 })

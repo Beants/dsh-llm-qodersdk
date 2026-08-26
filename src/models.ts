@@ -28,8 +28,17 @@ export class QoderModelCatalog {
   private cached: CatalogSnapshot | undefined
   private inflight: Promise<readonly ModelInfo[]> | undefined
 
+  private ttlMs: number
+
   /** @param ttlMs - how long a fetched catalog stays fresh before a re-fetch. */
-  constructor(private readonly ttlMs: number) {}
+  constructor(ttlMs: number) {
+    this.ttlMs = ttlMs
+  }
+
+  /** Live TTL update from the settings bridge; the cached snapshot stays. */
+  setTtl(ttlMs: number): void {
+    this.ttlMs = ttlMs
+  }
 
   /** Raw live entries; the stale snapshot when a refresh fails, else nothing. */
   async liveModels(): Promise<readonly ModelInfo[]> {
@@ -54,6 +63,10 @@ export class QoderModelCatalog {
       name: model.displayName.length > 0 ? model.displayName : model.value,
       ...model.description.length > 0 ? { description: model.description } : {},
       ...model.source === undefined ? {} : { source: model.source },
+      // Carry only an affirmative flag: `isVl === false` and an absent flag
+      // both mean text-only, so the static fallback and non-VL live entries
+      // serialize identically.
+      ...model.isVl === true ? { isVl: true } : {},
     }))
   }
 

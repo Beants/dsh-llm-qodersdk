@@ -14,6 +14,13 @@ export interface QoderCatalogModel {
   description?: string
   /** Where the model came from: `user` marks a qodercli custom model. */
   source?: 'system' | 'user'
+  /**
+   * Whether the CLI reports multimodal/vision input for this model
+   * (`ModelInfo.isVl`). Only the live catalog carries it; the static
+   * fallback stays text-only so an unreachable CLI never advertises
+   * image capability it cannot verify.
+   */
+  isVl?: boolean
 }
 
 /** Default combined context capacity assumed for Qoder-backed models. */

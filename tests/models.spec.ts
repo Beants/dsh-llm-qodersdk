@@ -17,7 +17,7 @@ vi.mock('@qoder-ai/qoder-agent-sdk', () => ({
   query: () => mockQuery,
 }))
 
-function liveModel(overrides: Partial<{ value: string, displayName: string, description: string, isEnabled: boolean, source: string }> = {}) {
+function liveModel(overrides: Partial<{ value: string, displayName: string, description: string, isEnabled: boolean, source: string, isVl: boolean }> = {}) {
   return {
     value: 'dmodel',
     displayName: 'DeepSeek-V4-Pro',
@@ -100,6 +100,19 @@ describe('QoderModelCatalog.models', () => {
       { id: 'a', name: 'A', description: 'desc a', source: 'user' },
       { id: 'c', name: 'c', source: 'system' },
     ])
+  })
+
+  it('carries an affirmative isVl flag through the mapping', async () => {
+    mockQuery.getAvailableModels.mockResolvedValue([
+      liveModel({ value: 'v', isVl: true }),
+      liveModel({ value: 'f', isVl: false }),
+      liveModel({ value: 'n' }),
+    ])
+    const catalog = new QoderModelCatalog(60_000)
+    const models = await catalog.models()
+    expect(models.find(m => m.id === 'v')).toMatchObject({ isVl: true })
+    expect(models.find(m => m.id === 'f')).not.toHaveProperty('isVl')
+    expect(models.find(m => m.id === 'n')).not.toHaveProperty('isVl')
   })
 
   it('falls back to the static catalog when the live list is empty', async () => {

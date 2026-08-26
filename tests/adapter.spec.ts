@@ -7,12 +7,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import {
-  QODER_BYOK_PROVIDER, QODER_PROVIDER, QoderAdapter, planContinuation, reasoningInfo,
+  QODER_BYOK_PROVIDER, QODER_PROVIDER, QoderAdapter, feedToChannelContent, planContinuation,
+  reasoningInfo, resolveImageRefsFrom,
 } from '../src/adapter.ts'
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from '../src/catalog.ts'
 
 const { catalogInstances } = vi.hoisted(() => ({
-  catalogInstances: [] as Array<{ liveModels: ReturnType<typeof vi.fn>, models: ReturnType<typeof vi.fn> }>,
+  catalogInstances: [] as Array<{
+    liveModels: ReturnType<typeof vi.fn>
+    models: ReturnType<typeof vi.fn>
+    setTtl: ReturnType<typeof vi.fn>
+  }>,
 }))
 
 vi.mock('../src/models.ts', () => ({
@@ -20,6 +25,7 @@ vi.mock('../src/models.ts', () => ({
   QoderModelCatalog: class {
     liveModels = vi.fn()
     models = vi.fn()
+    setTtl = vi.fn()
     constructor() {
       catalogInstances.push(this)
     }
@@ -129,6 +135,21 @@ describe('planContinuation', () => {
     expect(plan.feed).toContain('[用户] hi')
   })
 
+  it('keeps image references as parts when a fresh turn carries one', () => {
+    const imageBlock = {
+      type: 'image',
+      attachment: { attachmentId: 'i1', mediaType: 'image/png' as const, bytes: 3, width: 2, height: 2 },
+    }
+    const previous = [message('user', [text('a')])]
+    const current = [...previous, message('user', [text('look'), imageBlock as ContentBlock])]
+    const plan = planContinuation(previous, current)
+    expect(plan.rebuild).toBe(false)
+    expect(Array.isArray(plan.feed)).toBe(true)
+    const parts = plan.feed as Array<{ type: string, text?: string, attachment?: unknown }>
+    expect(parts[0]).toEqual({ type: 'text', text: '[用户] look' })
+    expect(parts[1]).toEqual({ type: 'image', attachment: imageBlock.attachment })
+  })
+
   it('feeds in-place mutations with the refresh marker', () => {
     const previous = [message('user', [text('a')]), message('user', [text('b')])]
     const current = [message('user', [text('a')]), message('user', [text('b!')]), message('user', [text('c')])]
@@ -158,6 +179,21 @@ describe('QoderAdapter.listModels', () => {
     ])
     const models = await adapter.listModels(QODER_BYOK_PROVIDER)
     expect(models.map(m => m.id)).toEqual(['custom1'])
+  })
+})
+
+describe('QoderAdapter.configure', () => {
+  it('applies and clears the live context-window override', async () => {
+    const adapter = new QoderAdapter()
+    catalogInstances[0]?.liveModels.mockResolvedValue([liveEntry()])
+    const windowOf = async (): Promise<number | undefined> =>
+      (await adapter.resolveModel(QODER_PROVIDER, 'dmodel')).context?.contextWindow
+    expect(await windowOf()).toBe(200_000)
+    adapter.configure({ maxSessions: 2, modelCacheTtlMs: 60_000, contextWindow: 400_000 })
+    expect(await windowOf()).toBe(400_000)
+    adapter.configure({ maxSessions: 2, modelCacheTtlMs: 60_000 })
+    expect(await windowOf()).toBe(200_000)
+    expect(catalogInstances[0]?.setTtl).toHaveBeenCalledWith(60_000)
   })
 })
 
@@ -206,5 +242,80 @@ describe('QoderAdapter.resolveModel', () => {
     expect(resolved.id).toBe('totally-unknown')
     expect(resolved.name).toBe('totally-unknown')
     expect(resolved.context?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW)
+  })
+
+  it('declares image input only for a live isVl model', async () => {
+    const adapter = new QoderAdapter()
+    catalogInstances[0]?.liveModels.mockResolvedValue([
+      liveEntry({ value: 'kmodel_latest' }),
+      liveEntry({ value: 'lite', isVl: false }),
+      liveEntry({ value: 'vmodel', isVl: true }),
+    ])
+    expect((await adapter.resolveModel(QODER_PROVIDER, 'kmodel_latest')).inputModalities).toEqual(['text'])
+    expect((await adapter.resolveModel(QODER_PROVIDER, 'vmodel')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel(QODER_PROVIDER, 'lite')).inputModalities).toEqual(['text'])
+  })
+})
+
+describe('feedToChannelContent', () => {
+  const ref = { attachmentId: 'i1', mediaType: 'image/png' as const, bytes: 3, width: 2, height: 2 }
+  const parts = [
+    { type: 'text' as const, text: '[用户] look' },
+    { type: 'image' as const, attachment: ref },
+  ]
+
+  it('degrades to placeholder text when the model lacks vision', () => {
+    expect(feedToChannelContent(parts, false, new Map())).toBe('[用户] look\n\n[图片附件]')
+  })
+
+  it('emits the SDK base64 image shape for resolved bytes', () => {
+    const images = new Map([['i1', { data: 'QUJD', mediaType: 'image/png' }]])
+    expect(feedToChannelContent(parts, true, images)).toEqual([
+      { type: 'text', text: '[用户] look' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'QUJD' } },
+    ])
+  })
+
+  it('degrades unreadable images to placeholder text on vision models', () => {
+    expect(feedToChannelContent(parts, true, new Map())).toEqual([
+      { type: 'text', text: '[用户] look' },
+      { type: 'text', text: '[图片附件（本次未能读取，请基于文字内容继续）]' },
+    ])
+  })
+})
+
+describe('resolveImageRefsFrom', () => {
+  const ref = (id: string) => ({ attachmentId: id, mediaType: 'image/png' as const, bytes: 3, width: 2, height: 2 })
+
+  function fakeStore(results: Record<string, { data: Uint8Array, mediaType: string } | Error>) {
+    const calls: Array<{ ref: unknown, options: { maxPixels: number, maxBytes: number } }> = []
+    return {
+      calls,
+      async readImageRequest(imageRef: { attachmentId: unknown }, options: { maxPixels: number, maxBytes: number }) {
+        calls.push({ ref: imageRef, options })
+        const result = results[String(imageRef.attachmentId)]
+        if (result instanceof Error) throw result
+        if (result === undefined) throw new Error('unknown attachment')
+        return result
+      },
+    }
+  }
+
+  it('base64-encodes each reference once with the request budgets', async () => {
+    const store = fakeStore({ a: { data: new Uint8Array([65, 66, 67]), mediaType: 'image/png' } })
+    const images = await resolveImageRefsFrom(store, [ref('a'), ref('a')])
+    expect(images.get('a')).toEqual({ data: 'QUJD', mediaType: 'image/png' })
+    expect(store.calls).toHaveLength(1)
+    expect(store.calls[0]?.options).toEqual({ maxPixels: 640_000, maxBytes: 1_048_576 })
+  })
+
+  it('degrades per-image failures while resolving the rest', async () => {
+    const store = fakeStore({
+      bad: new Error('deleted from disk'),
+      good: { data: new Uint8Array([65]), mediaType: 'image/jpeg' },
+    })
+    const images = await resolveImageRefsFrom(store, [ref('bad'), ref('good')])
+    expect(images.has('bad')).toBe(false)
+    expect(images.get('good')).toEqual({ data: 'QQ==', mediaType: 'image/jpeg' })
   })
 })

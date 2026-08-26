@@ -8,6 +8,7 @@
  * @module dsh-llm-qoder/session
  */
 
+import { randomUUID } from 'node:crypto'
 import {
   CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, QUOTA_EXCEEDED_CODE,
   isContextWindowExceededError, isQuotaExceededError,
@@ -18,7 +19,7 @@ import type {
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
-import { renderInitialFeed } from './render.ts'
+import { imageRefCount, renderInitialFeed } from './render.ts'
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -28,11 +29,49 @@ const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 /** How long an MCP tool handler waits for the host tool result before failing the call. */
 const TOOL_RESULT_TIMEOUT_MS = 120_000
 
+/**
+ * Fixed input-char charge per forwarded image, mirroring how vision payloads
+ * inflate a request far beyond their text length. Priced into the token
+ * estimate (4 chars/token) the context meter and compaction threshold read.
+ */
+const IMAGE_ESTIMATED_CHARS = 4_800
+
 interface ChannelMessage {
   type: 'user'
-  message: { role: 'user', content: Array<{ type: 'text', text: string }> }
+  message: { role: 'user', content: ChannelContent[] }
   parent_tool_use_id: null
 }
+
+/**
+ * One user-turn content block on the streaming-input channel. Text is the
+ * historical protocol; image blocks mirror the SDK's own vision shape
+ * (`FileReadOutputImage`: base64 source with `media_type`), which the
+ * qodercli backend accepts in user messages.
+ */
+export type ChannelContent =
+  | { type: 'text', text: string }
+  | { type: 'image', source: { type: 'base64', media_type: string, data: string } }
+
+/**
+ * One MCP tool-result content block. Text is the historical protocol; image
+ * blocks use the MCP SDK's `ImageContent` shape (base64 `data` + `mimeType`).
+ */
+export type McpContent =
+  | { type: 'text', text: string }
+  | { type: 'image', data: string, mimeType: string }
+
+/** A host tool result delivered to a parked/buffered MCP handler. */
+export interface ToolResultPayload {
+  content: McpContent[]
+  isError: boolean
+}
+
+/**
+ * Request-image bytes resolved by the adapter, keyed by attachment id:
+ * canonical base64 plus the verified media type. Absent ids degrade to
+ * placeholder text.
+ */
+export type ResolvedImages = ReadonlyMap<string, { data: string, mediaType: string }>
 
 /** Minimal push-only async channel feeding the SDK's streaming-input mode. */
 function createChannel(): AsyncIterable<ChannelMessage> & { push(message: ChannelMessage): void } {
@@ -107,7 +146,7 @@ class TurnQueue implements AsyncIterable<QueueItem> {
   }
 }
 
-interface ParkedResolver { (result: { text: string, isError: boolean }): void }
+interface ParkedResolver { (result: ToolResultPayload): void }
 
 /** One tool-use block under assembly in the active turn. */
 interface ToolUnderAssembly {
@@ -188,7 +227,7 @@ export class QoderSession {
    * slot. Results buffer by tool-use id until their handler fires.
    */
   private readonly parked = new Map<string, ParkedResolver>()
-  private readonly pendingResults = new Map<string, { text: string, isError: boolean }>()
+  private readonly pendingResults = new Map<string, ToolResultPayload>()
   /** qodercli tool-use ids in canUseTool (execution) order, claimed by MCP handlers. */
   private readonly toolUseQueue: string[] = []
   /** Host callId (qoder-N) → qodercli tool-use id, from the content-block ids. */
@@ -200,6 +239,13 @@ export class QoderSession {
   private reasoningEffort: string | undefined
   private contextWindow: number | undefined
   private callCounter = 0
+  /**
+   * Per-instance nonce for host call ids. Ids must stay unique across the whole
+   * host session history — inner-session rebuilds, warm-session eviction, and
+   * host restarts all recreate this class — because the conversation replay
+   * keys tool-call blocks by id and rejects a second start for a seen id.
+   */
+  private readonly callNonce = randomUUID().slice(0, 8)
   private abortPending = false
   private disposed = false
   /** Previous request's messages for delta feeding. */
@@ -320,12 +366,12 @@ export class QoderSession {
         this.mcp.instance.registerTool(schema.name, {
           description: schema.description.length > 0 ? schema.description : schema.name,
           inputSchema: shape,
-        }, async (args: unknown): Promise<{ content: Array<{ type: 'text', text: string }>, isError?: boolean }> => {
+        }, async (args: unknown): Promise<{ content: McpContent[], isError?: boolean }> => {
           void args
           const toolUseId = this.toolUseQueue.shift()
-          let result: { text: string, isError: boolean }
+          let result: ToolResultPayload
           if (toolUseId !== undefined && this.pendingResults.has(toolUseId)) {
-            result = this.pendingResults.get(toolUseId) as { text: string, isError: boolean }
+            result = this.pendingResults.get(toolUseId) as ToolResultPayload
             this.pendingResults.delete(toolUseId)
           } else {
             const key = toolUseId ?? `anon-${this.callCounter}-${this.parked.size}`
@@ -333,11 +379,14 @@ export class QoderSession {
             // leave the inner process waiting forever. On timeout the call
             // fails with an error so qodercli's loop recovers instead of
             // deadlocking.
-            result = await new Promise<{ text: string, isError: boolean }>(resolve => {
+            result = await new Promise<ToolResultPayload>(resolve => {
               const timer = setTimeout(() => {
                 this.parked.delete(key)
                 resolve({
-                  text: `宿主在 ${TOOL_RESULT_TIMEOUT_MS / 1000}s 内未返回工具结果（toolUseId=${key}），本次工具调用已取消`,
+                  content: [{
+                    type: 'text',
+                    text: `宿主在 ${TOOL_RESULT_TIMEOUT_MS / 1000}s 内未返回工具结果（toolUseId=${key}），本次工具调用已取消`,
+                  }],
                   isError: true,
                 })
               }, TOOL_RESULT_TIMEOUT_MS)
@@ -348,7 +397,7 @@ export class QoderSession {
             })
           }
           return {
-            content: [{ type: 'text', text: result.text }],
+            content: result.content,
             ...result.isError ? { isError: true } : {},
           }
         })
@@ -361,8 +410,13 @@ export class QoderSession {
     }
   }
 
-  /** Deliver host tool results to parked/buffered handlers, keyed by callId. */
-  deliverToolResults(tail: readonly Message[]): void {
+  /**
+   * Deliver host tool results to parked/buffered handlers, keyed by callId.
+   * @param tail - the host messages appended since the previous request.
+   * @param images - adapter-resolved request images keyed by attachment id;
+   * ids missing from the map render as placeholder text.
+   */
+  deliverToolResults(tail: readonly Message[], images?: ResolvedImages): void {
     let freshUserTurn = false
     for (const message of tail) {
       if (message.role === 'user' && message.source.kind !== 'tool') {
@@ -373,7 +427,10 @@ export class QoderSession {
       const block = message.content[0]
       if (block === undefined || block.type !== 'tool-result') continue
       const callId = String(block.toolCallId)
-      const payload = { text: renderResultText(block.content), isError: block.isError === true }
+      const payload: ToolResultPayload = {
+        content: renderResultContent(block.content, images),
+        isError: block.isError === true,
+      }
       // Key by the qodercli tool-use id the host callId maps to; without a
       // mapping (a call the host never surfaced) fall back to the callId so
       // the entry still buffers for any handler that parked under it.
@@ -391,22 +448,31 @@ export class QoderSession {
     if (freshUserTurn && this.parked.size > 0) {
       const stale = [...this.parked.entries()]
       this.parked.clear()
-      for (const [, resolve] of stale) resolve({ text: '[宿主取消了这次工具执行]', isError: true })
+      for (const [, resolve] of stale) resolve({ content: [{ type: 'text', text: '[宿主取消了这次工具执行]' }], isError: true })
     }
   }
 
-  /** Run one inner turn: feed (if any) then pump consumer chunks until finish. */
-  async *stream(options: GenerateOptions, feed: string | null): AsyncGenerator<StreamChunk> {
+  /**
+   * Run one inner turn: feed (if any) then pump consumer chunks until finish.
+   * @param options - the host request (signal, tools already registered).
+   * @param feed - literal text feed, resolved content blocks (vision turns),
+   * or null for a pure tool-result continuation.
+   */
+  async *stream(options: GenerateOptions, feed: string | ChannelContent[] | null): AsyncGenerator<StreamChunk> {
     if (this.queue !== null) throw new LlmError(`qoder session ${this.sessionId} already has a turn in flight`, 'CONFLICT')
     if (this.disposed) throw new LlmError(`qoder session ${this.sessionId} was disposed`, 'TRANSPORT')
     const q = this.ensureStarted()
     this.queue = new TurnQueue()
     this.resetTurnState()
     if (feed !== null) {
-      this.turnInputChars += feed.length
+      const content: ChannelContent[] = typeof feed === 'string' ? [{ type: 'text', text: feed }] : feed
+      // Charge images a fixed estimate so the context meter stays sane on
+      // vision turns (text is priced by exact chars elsewhere).
+      const imageCharge = content.filter(block => block.type === 'image').length * IMAGE_ESTIMATED_CHARS
+      this.turnInputChars += (typeof feed === 'string' ? feed.length : content.reduce((n, block) => n + (block.type === 'text' ? block.text.length : 0), 0)) + imageCharge
       this.channel.push({
         type: 'user',
-        message: { role: 'user', content: [{ type: 'text', text: feed }] },
+        message: { role: 'user', content },
         parent_tool_use_id: null,
       })
     }
@@ -414,7 +480,10 @@ export class QoderSession {
     let abortTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
       this.abortPending = true
-      void q.interrupt()
+      // interrupt() rides the same transport the teardown may already have
+      // killed (host abort racing shutdown); a dead-transport rejection here
+      // must not escape as an unhandled rejection through dsh's fail-loud.
+      void q.interrupt().catch(() => undefined)
       // Fallback: end the turn if the inner process does not settle promptly.
       abortTimer = setTimeout(() => this.endTurn({ kind: 'aborted', failure: { message: 'qoder session aborted by host', code: 'ABORTED' } }), 5_000)
     }
@@ -510,8 +579,9 @@ export class QoderSession {
    * @param messages - the full host message list included in this request.
    */
   recordRequestInput(system: string | undefined, messages: readonly Message[]): void {
-    const rendered = renderInitialFeed(system, messages)
-    this.estimatedInputTokens = Math.max(1, Math.ceil(rendered.length / 4))
+    const imageCount = messages.reduce((n, message) => n + imageRefCount(message.content), 0)
+    const estimate = renderInitialFeed(system, messages).length + imageCount * IMAGE_ESTIMATED_CHARS
+    this.estimatedInputTokens = Math.max(1, Math.ceil(estimate / 4))
   }
 
   private endTurn(reason: FinishReason, usage?: TokenUsage): void {
@@ -560,7 +630,7 @@ export class QoderSession {
             // canUseTool/handler sequence is paired by tool-use id anyway, so
             // skipping them keeps the host transcript consistent.
             if (this.queue === null || this.queue.isClosed) break
-            const callId = `qoder-${++this.callCounter}`
+            const callId = `qoder-${this.callNonce}-${++this.callCounter}`
             if (typeof block.id === 'string' && block.id.length > 0) {
               this.hostCallByToolUse.set(callId, block.id)
             }
@@ -689,15 +759,25 @@ export class QoderSession {
   }
 }
 
-/** Render tool-result content blocks into the single text the inner model reads. */
-export function renderResultText(blocks: readonly ContentBlock[]): string {
-  const parts: string[] = []
+/**
+ * Render tool-result content blocks into the MCP content the inner model
+ * reads. Text joins as before; images resolve from the adapter-provided map
+ * or degrade to placeholder text. Non-text, non-image blocks stringify.
+ */
+export function renderResultContent(blocks: readonly ContentBlock[], images?: ResolvedImages): McpContent[] {
+  const content: McpContent[] = []
   for (const block of blocks) {
-    if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'image') parts.push('[图片结果]')
-    else parts.push(JSON.stringify(block))
+    if (block.type === 'text') {
+      content.push({ type: 'text', text: block.text })
+    } else if (block.type === 'image') {
+      const resolved = images?.get(String(block.attachment.attachmentId))
+      if (resolved !== undefined) content.push({ type: 'image', data: resolved.data, mimeType: resolved.mediaType })
+      else content.push({ type: 'text', text: '[图片结果]' })
+    } else {
+      content.push({ type: 'text', text: JSON.stringify(block) })
+    }
   }
-  return parts.join('\n')
+  return content
 }
 
 /** Safely stringify the SDK error payload for turn diagnostics. */
@@ -727,7 +807,29 @@ export function classifyTurnError(detail: string): string {
 export class QoderSessionManager {
   private readonly sessions = new Map<string, QoderSession>()
 
-  constructor(readonly maxSessions = 8) {}
+  /** Live capacity; the settings bridge may shrink or grow it at any time. */
+  private capacity: number
+
+  constructor(maxSessions = 8) {
+    this.capacity = maxSessions
+  }
+
+  /** Live capacity update; shrinking evicts the least-recently-used sessions. */
+  resize(maxSessions: number): void {
+    this.capacity = maxSessions
+    this.evictOverflow()
+  }
+
+  /** Close oldest sessions until the map fits the capacity. */
+  private evictOverflow(): void {
+    while (this.sessions.size > this.capacity) {
+      const oldest = this.sessions.keys().next()
+      if (oldest.done === true) break
+      const victim = this.sessions.get(oldest.value)
+      this.sessions.delete(oldest.value)
+      victim?.close()
+    }
+  }
 
   /** Existing or fresh warm session for one host session id. */
   forSession(sessionId: string, model: string): QoderSession {
@@ -739,13 +841,7 @@ export class QoderSessionManager {
     }
     const session = new QoderSession(sessionId, model)
     this.sessions.set(sessionId, session)
-    while (this.sessions.size > this.maxSessions) {
-      const oldest = this.sessions.keys().next()
-      if (oldest.done === true) break
-      const victim = this.sessions.get(oldest.value)
-      this.sessions.delete(oldest.value)
-      victim?.close()
-    }
+    this.evictOverflow()
     return session
   }
 
@@ -763,7 +859,12 @@ export class QoderSessionManager {
   }
 
   /** One-shot turn with no warm state: side channels and cold rebuilds. */
-  async *coldStream(options: GenerateOptions, prompt: string, model?: string): AsyncGenerator<StreamChunk> {
+  async *coldStream(
+    options: GenerateOptions,
+    prompt: string,
+    model?: string,
+    contextWindow?: number,
+  ): AsyncGenerator<StreamChunk> {
     const q = query({
       prompt,
       options: {
@@ -774,26 +875,46 @@ export class QoderSessionManager {
         settingSources: [],
         maxTurns: 4,
         ...model === undefined ? {} : { model },
+        // Pull-mode model policy: with an explicit window override, answer
+        // the CLI's per-call get_model_policy so one-shot side channels
+        // (compaction summaries especially) run inside the SAME enlarged
+        // window as warm sessions instead of the 200K default.
+        ...contextWindow === undefined ? {} : {
+          resolveModel: () => ({
+            // 'auto' is the CLI's documented catch-all platform model id;
+            // unreachable in practice since the adapter passes a resolved model.
+            model: model ?? 'auto',
+            parameters: { contextWindow },
+          }),
+        },
       },
     })
     const signal = options.signal
-    const onAbort = (): void => { void q.interrupt() }
+    const onAbort = (): void => { void q.interrupt().catch(() => undefined) }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       let text = ''
       let failure: { message: string, code: string } | undefined
-      for await (const message of q) {
-        const msg = message as SdkMessage
-        if (msg.type === 'assistant') {
-          const chunk = (msg.message?.content ?? [])
-            .filter(block => block.type === 'text')
-            .map(block => block.text ?? '')
-            .join('')
-          if (chunk.length > 0) text += chunk
-        } else if (msg.type === 'result' && msg.subtype !== 'success' && msg.subtype !== undefined) {
-          const detail = `${msg.subtype} ${safeErrors(msg.errors)}`
-          failure = { message: `qoder side-channel turn failed: ${detail}`, code: classifyTurnError(detail) }
+      try {
+        for await (const message of q) {
+          const msg = message as SdkMessage
+          if (msg.type === 'assistant') {
+            const chunk = (msg.message?.content ?? [])
+              .filter(block => block.type === 'text')
+              .map(block => block.text ?? '')
+              .join('')
+            if (chunk.length > 0) text += chunk
+          } else if (msg.type === 'result' && msg.subtype !== 'success' && msg.subtype !== undefined) {
+            const detail = `${msg.subtype} ${safeErrors(msg.errors)}`
+            failure = { message: `qoder side-channel turn failed: ${detail}`, code: classifyTurnError(detail) }
+          }
         }
+      } catch (error) {
+        // Abandoning this loop while the host aborts (Ctrl+C teardown included)
+        // runs the iterator's return(), whose SDK close chain rejects once the
+        // child process is already dead — surface as the aborted finish below
+        // instead of an unhandled rejection through dsh's fail-loud handler.
+        if (signal?.aborted !== true) throw error
       }
       if (signal?.aborted === true) {
         yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted by host', code: 'ABORTED' } } }

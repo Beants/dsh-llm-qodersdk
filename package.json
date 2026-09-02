@@ -25,7 +25,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsdown",
     "prepublishOnly": "npm run build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepare": "npm run build"
   },
   "license": "MIT",
   "repository": {

@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto'
 import {
-  CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, QUOTA_EXCEEDED_CODE,
+  CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, QUOTA_EXCEEDED_CODE,
   isContextWindowExceededError, isQuotaExceededError,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -18,6 +18,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
+import { brandToolCallId } from './compat.ts'
 import { jsonSchemaToShape } from './jsonschema.ts'
 import { imageRefCount, renderInitialFeed } from './render.ts'
 
@@ -647,7 +648,7 @@ export class QoderSession {
             this.emit({
               type: 'tool-call-delta',
               index: chunkIndex,
-              id: CallId(callId),
+              id: brandToolCallId(callId),
               name: this.openTool.name,
               argumentsDelta: '',
             })
@@ -678,7 +679,7 @@ export class QoderSession {
             this.emit({
               type: 'tool-call-delta',
               index: this.openTool.chunkIndex,
-              id: CallId(this.openTool.callId),
+              id: brandToolCallId(this.openTool.callId),
               argumentsDelta: delta.partial_json,
             })
           }
@@ -691,7 +692,7 @@ export class QoderSession {
               index: this.openTool.chunkIndex,
               block: {
                 type: 'tool-call',
-                id: CallId(this.openTool.callId),
+                id: brandToolCallId(this.openTool.callId),
                 name: this.openTool.name,
                 arguments: this.openTool.arguments,
               },

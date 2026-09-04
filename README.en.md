@@ -212,7 +212,7 @@ pnpm publish     # prepublishOnly builds first
 
 The build config is in place (`tsconfig.json` + `tsdown.config.ts`); peer dependencies `@deepseek-ai/dsh-llm` and `@deepseek-ai/cordis` stay external.
 
-> **Version note**: the peer dependencies `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` are pinned exactly to `0.1.1-rc.2` — the dsh 0.1.1-rc.x runtime's `LlmAdapter` base class gained a concrete `prepareCall` method (every call dispatches through it), and the same-named `0.1.1-rc.x` tarballs on npm differ from one another; pinning rc.2 guarantees the base class the plugin loads is byte-identical to the runtime's built-in copy. This repo builds directly with `pnpm install && pnpm test && pnpm run build`.
+> **Version note**: the peer dependencies `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` declare `0.1.1-rc.2 || 0.1.2-rc.1` — one build serves both host generations. Types compile against `0.1.2-rc.1`; the two cross-generation gaps are absorbed at runtime by `src/compat.ts`: dsh-llm `0.1.2-rc.1` renamed `CallId` to `ToolCallId`, and dsh-settings `0.1.2-rc.1` dropped the standalone `installSettingsSection` / `settingsNamespace` exports (replaced by the settings-service `installSection` method with plain-string namespaces). The test suite passes in full under both host generations. The original exact pin to `0.1.1-rc.2` existed because same-named `0.1.1-rc.x` tarballs on npm differed from one another (`LlmAdapter.prepareCall` presence); the explicit `0.1.2-rc.1` version removes that ambiguity. This repo builds directly with `pnpm install && pnpm test && pnpm run build`.
 
 ## License
 

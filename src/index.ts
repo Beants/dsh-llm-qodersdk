@@ -11,7 +11,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { installSettingsSectionCompat, settingsNamespaceCompat } from './compat.ts'
 import { QoderAdapter, QODER_BYOK_PROVIDER, QODER_PROVIDER } from './adapter.ts'
 import type { AttachmentStoreLike } from './adapter.ts'
 
@@ -23,7 +23,7 @@ export { QoderModelCatalog } from './models.ts'
 export const name = 'llm-qoder'
 export const inject = ['llm']
 
-const NS = settingsNamespace('llm-qoder')
+const NS = settingsNamespaceCompat('llm-qoder')
 
 /** Plugin config; the adapter works entirely off local qodercli auth. */
 export interface Config {
@@ -68,7 +68,7 @@ export function apply(ctx: Context, config: Config): void {
     { provider: QODER_BYOK_PROVIDER, displayName: 'Qoder 自定义', settingsNs: NS, settingsPath: [] },
   ])
   let effective: Config = config
-  installSettingsSection(ctx, NS, Config, config, {
+  installSettingsSectionCompat(ctx, NS, Config, config, {
     // The settings service is the ONLY bridge for user-layer values: the
     // profile loader hands apply() just the bundle-declared base, so without
     // these hooks a settings.yaml section would never reach the adapter. The

@@ -212,7 +212,7 @@ pnpm publish     # prepublishOnly 自动先构建
 
 构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
 
-> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` 精确钉在 `0.1.1-rc.2`——dsh 0.1.1-rc.x 运行时的 `LlmAdapter` 基类新增了 `prepareCall` 具体方法（所有调用经它派发），而 npm 上 `0.1.1-rc.x` 同名版本的 tarball 内容互不一致；钉死 rc.2 保证插件加载的基类与运行时内置副本逐字节一致。本仓库可直接 `pnpm install && pnpm test && pnpm run build`。
+> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings` 声明为 `0.1.1-rc.2 || 0.1.2-rc.1`，一套构建同时跑两代宿主。类型按 `0.1.2-rc.1` 编译；两处跨代差异由 `src/compat.ts` 在运行时探测消化——dsh-llm `0.1.2-rc.1` 把 `CallId` 改名 `ToolCallId`，dsh-settings `0.1.2-rc.1` 删除了独立函数 `installSettingsSection` / `settingsNamespace`（改为 settings 服务的 `installSection` 方法 + 普通字符串命名空间）。两代宿主下测试套件各自全绿。历史上钉死 `0.1.1-rc.2` 的原因是 npm 上 `0.1.1-rc.x` 同名版本 tarball 内容互不一致（`LlmAdapter.prepareCall` 有无），升级到 `0.1.2-rc.1` 后以显式版本号消歧。本仓库可直接 `pnpm install && pnpm test && pnpm run build`。
 
 ## License
 

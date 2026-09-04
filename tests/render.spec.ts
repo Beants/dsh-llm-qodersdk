@@ -2,7 +2,8 @@
  * Feed rendering: block, message, and feed composition pure functions.
  */
 import { describe, expect, it } from 'vitest'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { brandToolCallId } from '../src/compat.ts'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import {
   assembleFeed, blockParts, contentHasImage, imageRefCount, imageRefs, renderBlocks, renderIdentityAppend,
@@ -45,12 +46,12 @@ describe('renderBlocks', () => {
   })
 
   it('renders tool calls as placeholders', () => {
-    expect(renderBlocks([{ type: 'tool-call', id: CallId('c1'), name: 'read', arguments: '{"path":"a"}' }]))
+    expect(renderBlocks([{ type: 'tool-call', id: brandToolCallId('c1'), name: 'read', arguments: '{"path":"a"}' }]))
       .toBe('[调用了工具 read({"path":"a"})]')
   })
 
   it('renders tool results recursively', () => {
-    expect(renderBlocks([{ type: 'tool-result', toolCallId: CallId('c1'), content: [text('ok')] }]))
+    expect(renderBlocks([{ type: 'tool-result', toolCallId: brandToolCallId('c1'), content: [text('ok')] }]))
       .toBe('[工具结果 c1] ok')
   })
 
@@ -121,9 +122,9 @@ describe('vision part rendering', () => {
   it('detects images, nested in tool results', () => {
     expect(contentHasImage([text('a')])).toBe(false)
     expect(contentHasImage([image('i1')])).toBe(true)
-    expect(contentHasImage([{ type: 'tool-result', toolCallId: CallId('c1'), content: [image('i1')] }])).toBe(true)
+    expect(contentHasImage([{ type: 'tool-result', toolCallId: brandToolCallId('c1'), content: [image('i1')] }])).toBe(true)
     expect(imageRefCount([text('a'), image('i1'), image('i2')])).toBe(2)
-    expect(imageRefs([{ type: 'tool-result', toolCallId: CallId('c1'), content: [image('i2'), text('t')] }, image('i1')])
+    expect(imageRefs([{ type: 'tool-result', toolCallId: brandToolCallId('c1'), content: [image('i2'), text('t')] }, image('i1')])
       .map(ref => String(ref.attachmentId))).toEqual(['i2', 'i1'])
   })
 

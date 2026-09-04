@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { brandToolCallId } from '../src/compat.ts'
 import type { ContentBlock, GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { renderInitialFeed } from '../src/render.ts'
 import {
@@ -138,8 +139,8 @@ function toolResultMessage(callId: string, text: string): Message {
   return {
     id: MessageId('m1'),
     role: 'user',
-    source: { kind: 'tool', callId: CallId(callId) },
-    content: [{ type: 'tool-result', toolCallId: CallId(callId), content: [{ type: 'text', text }] }],
+    source: { kind: 'tool', callId: brandToolCallId(callId) },
+    content: [{ type: 'tool-result', toolCallId: brandToolCallId(callId), content: [{ type: 'text', text }] }],
   }
 }
 
@@ -151,10 +152,10 @@ function imageToolResultMessage(callId: string): Message {
   return {
     id: MessageId('m1'),
     role: 'user',
-    source: { kind: 'tool', callId: CallId(callId) },
+    source: { kind: 'tool', callId: brandToolCallId(callId) },
     content: [{
       type: 'tool-result',
-      toolCallId: CallId(callId),
+      toolCallId: brandToolCallId(callId),
       content: [{ type: 'text', text: 'shot' }, imageBlock as { type: 'text', text: string }],
     }],
   }

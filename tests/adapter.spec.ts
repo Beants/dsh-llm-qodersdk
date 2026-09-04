@@ -4,7 +4,8 @@
  * pure decision helpers are tested directly.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { brandToolCallId } from '../src/compat.ts'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import {
   QODER_BYOK_PROVIDER, QODER_PROVIDER, QoderAdapter, feedToChannelContent, planContinuation,
@@ -120,8 +121,8 @@ describe('planContinuation', () => {
     const previous = [message('user', [text('a')])]
     const current = [
       ...previous,
-      message('user', [{ type: 'tool-result', toolCallId: CallId('c1'), content: [text('ok')] }], {
-        source: { kind: 'tool', callId: CallId('c1') },
+      message('user', [{ type: 'tool-result', toolCallId: brandToolCallId('c1'), content: [text('ok')] }], {
+        source: { kind: 'tool', callId: brandToolCallId('c1') },
       }),
     ]
     expect(planContinuation(previous, current)).toEqual({ feed: null, rebuild: false })

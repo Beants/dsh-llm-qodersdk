@@ -236,6 +236,23 @@ describe('QoderAdapter.resolveModel', () => {
     expect(resolved.defaultMaxTokens).toBe(DEFAULT_MAX_TOKENS)
   })
 
+  it('echoes the requested model id for SDK values and aliases', async () => {
+    // The host validates resolveModel's id against the exact model it asked
+    // about (INVALID_MODEL_INFO on both host generations), so an alias must
+    // resolve to itself while the aliased live entry supplies the metadata.
+    const adapter = new QoderAdapter()
+    catalogInstances[0]?.liveModels.mockResolvedValue([
+      liveEntry(),
+      liveEntry({ value: 'dfmodel', displayName: 'DeepSeek-V4-Flash' }),
+    ])
+    expect((await adapter.resolveModel(QODER_PROVIDER, 'dmodel')).id).toBe('dmodel')
+    const alias = await adapter.resolveModel(QODER_PROVIDER, 'deepseek-v4-flash')
+    expect(alias.id).toBe('deepseek-v4-flash')
+    expect(alias.provider).toBe(QODER_PROVIDER)
+    expect(alias.name).toBe('DeepSeek-V4-Flash')
+    expect(alias.context?.contextWindow).toBe(200_000)
+  })
+
   it('passes through unknown model ids with defaults', async () => {
     const adapter = new QoderAdapter()
     catalogInstances[0]?.liveModels.mockResolvedValue([])

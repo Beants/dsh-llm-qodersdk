@@ -187,7 +187,11 @@ export class QoderAdapter extends LlmAdapter {
       const reasoning = reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning)
       return {
         provider,
-        id: live.value,
+        // Echo the requested id, not the SDK value: the host validates the
+        // resolved metadata's id against the model it asked about (both host
+        // generations), so an alias ('deepseek-v4-flash') must resolve to
+        // itself, with the live entry supplying name/context/reasoning.
+        id: model,
         name: live.displayName.length > 0 ? live.displayName : live.value,
         ...live.description.length > 0 ? { description: live.description } : {},
         // Only an affirmative CLI `isVl` declares image input: the harness
